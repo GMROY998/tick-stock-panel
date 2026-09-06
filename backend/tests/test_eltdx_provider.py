@@ -1,5 +1,6 @@
 """eltdx-gateway 数据源插件离线单测: 代码转换、日K/分钟映射、快照 schema、
-五档 depth 映射、设置页试拉与 depth_service 偏好路由。"""
+五档 depth 映射与设置页试拉。(depth_service 偏好路由由上游
+tests/test_custom_depth_provider.py 覆盖)"""
 
 from __future__ import annotations
 
@@ -308,7 +309,7 @@ def test_depth_batch_maps_five_levels():
         return None
 
     prov, _ = make_provider(handler)
-    out = prov.batch(["000001.SZ", "600519.SH"])
+    out = prov.get_depth_batch(["000001.SZ", "600519.SH"])
     assert set(out) == {"000001.SZ", "600519.SH"}
     d = out["000001.SZ"]
     assert d["bid_volumes"] == [908, 909, 910, 911, 912]
@@ -327,7 +328,7 @@ def test_depth_batch_chunking_and_unsupported(monkeypatch):
         return None
 
     prov, _ = make_provider(handler)
-    out = prov.batch(["000001.SZ", "600519.SH", "830799.BJ", "300750.SZ"])
+    out = prov.get_depth_batch(["000001.SZ", "600519.SH", "830799.BJ", "300750.SZ"])
     assert len(seen) == 2                                  # ceil(3/2)
     assert set(out) == {"000001.SZ", "600519.SH", "300750.SZ"}
 
@@ -374,128 +375,3 @@ def test_availability_delegates_to_health(monkeypatch):
     monkeypatch.setattr(eltdx_mod, "EltdxClient", FakeHealthClient)
     ok, msg = eltdx_mod.availability()
     assert not ok and "网关不可达" in msg
-
-
-# ---------------------------------------------------------------- depth_service 路由
-class _FakePluginDepth:
-    def __init__(self, result=None, exc=None):
-        self.result = result if result is not None else {
-            "000001.SZ": {"ask_volumes": [0], "bid_volumes": [1234], "timestamp": 1}}
-        self.exc = exc
-        self.calls: list[list[str]] = []
-
-    def batch(self, symbols):
-        self.calls.append(list(symbols))
-        if self.exc:
-            raise self.exc
-        return self.result
-
-
-class _FakeTickFlowDepth:
-    def __init__(self):
-        self.calls: list[list[str]] = []
-
-    def batch(self, symbols):
-        self.calls.append(list(symbols))
-        return {"000001.SZ": {"ask_volumes": [9], "bid_volumes": [9], "timestamp": 2}}
-
-
-def _route(monkeypatch, plugin_name):
-    """把 DepthService 的偏好/注册表路由劫持到 fake。"""
-    from app.services.depth_service import DepthService
-
-    svc = DepthService()
-    tf = _FakeTickFlowDepth()
-    svc._tf_depth = tf
-    plugin = _FakePluginDepth()
-    monkeypatch.setattr("app.services.preferences.get_depth5_data_provider",
-                        lambda: plugin_name)
-    monkeypatch.setattr("app.data_providers.custom.provider_has_dataset",
-                        lambda name, ds: True)
-    monkeypatch.setattr("app.data_providers.custom.get_provider", lambda name: plugin)
-    return svc, plugin, tf
-
-
-def test_depth_routes_to_plugin_by_preference(monkeypatch):
-    svc, plugin, tf = _route(monkeypatch, "eltdx")
-    out = svc._call_depth_batch(["000001.SZ"])
-    assert out["000001.SZ"]["ask_volumes"] == [0]
-    assert plugin.calls == [["000001.SZ"]]
-    assert tf.calls == []                                  # 不应回退
-
-
-def test_depth_falls_back_to_tickflow_on_plugin_failure(monkeypatch):
-    svc, plugin, tf = _route(monkeypatch, "eltdx")
-    plugin.exc = RuntimeError("gateway down")
-    out = svc._call_depth_batch(["000001.SZ"])
-    assert out["000001.SZ"]["ask_volumes"] == [9]          # TickFlow 兜底
-    assert tf.calls == [["000001.SZ"]]
-
-
-def test_depth_falls_back_on_empty_plugin_result(monkeypatch):
-    svc, plugin, tf = _route(monkeypatch, "eltdx")
-    plugin.result = {}
-    out = svc._call_depth_batch(["000001.SZ"])
-    assert out["000001.SZ"]["ask_volumes"] == [9]
-    assert tf.calls == [["000001.SZ"]]
-
-
-def test_depth_tickflow_preference_never_touches_plugin(monkeypatch):
-    svc, plugin, tf = _route(monkeypatch, "tickflow")
-    out = svc._call_depth_batch(["000001.SZ"])
-    assert out["000001.SZ"]["ask_volumes"] == [9]
-    assert plugin.calls == [] and tf.calls == [["000001.SZ"]]
-
-
-# ---------------------------------------------------------------- TickFlowDepthProvider
-def test_tickflow_depth_provider_slices_and_throttles(monkeypatch):
-    from app.data_providers.depth_provider import TickFlowDepthProvider
-
-    from types import SimpleNamespace
-    import app.tickflow.client as tf_client_mod
-    import app.tickflow.rate_limits as rl_mod
-
-    seen_chunks: list[list[str]] = []
-
-    class FakeTF:
-        class depth:
-            @staticmethod
-            def batch(chunk):
-                seen_chunks.append(list(chunk))
-                return {s: {"ask_volumes": [0], "bid_volumes": [1], "timestamp": 3}
-                        for s in chunk}
-
-    monkeypatch.setattr(tf_client_mod, "get_client", lambda: FakeTF)
-    monkeypatch.setattr(rl_mod, "resolve_limit",
-                        lambda *a, **k: SimpleNamespace(batch=2, rpm=0))
-    monkeypatch.setattr(rl_mod, "sleep_between_batches", lambda *a, **k: None)
-
-    out = TickFlowDepthProvider().batch(["a", "b", "c"])
-    assert seen_chunks == [["a", "b"], ["c"]]
-    assert set(out) == {"a", "b", "c"}
-
-
-def test_tickflow_depth_provider_single_chunk_failure_tolerated(monkeypatch):
-    from app.data_providers.depth_provider import TickFlowDepthProvider
-
-    from types import SimpleNamespace
-    import app.tickflow.client as tf_client_mod
-    import app.tickflow.rate_limits as rl_mod
-
-    class FakeDepth:
-        @staticmethod
-        def batch(chunk):
-            if "b" in chunk:
-                raise RuntimeError("boom")
-            return {s: {"ask_volumes": [1], "bid_volumes": [1], "timestamp": 3} for s in chunk}
-
-    class FakeTF:
-        depth = FakeDepth
-
-    monkeypatch.setattr(tf_client_mod, "get_client", lambda: FakeTF)
-    monkeypatch.setattr(rl_mod, "resolve_limit",
-                        lambda *a, **k: SimpleNamespace(batch=2, rpm=0))
-    monkeypatch.setattr(rl_mod, "sleep_between_batches", lambda *a, **k: None)
-
-    out = TickFlowDepthProvider(capset_provider=lambda: None).batch(["a", "b", "c"])
-    assert set(out) == {"c"}                               # 失败批(a,b)整体跳过

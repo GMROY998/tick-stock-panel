@@ -15,8 +15,10 @@
            name/amplitude/turnover_rate 置空(交下游维表)。
            实测约 1100 只代码无快照行(退市/长期停牌), 属数据源正常行为。
 - depth5   实时五档: quotes.get_depth, sell/buy_levels 五档量(手) →
-           ask_volumes/bid_volumes, timestamp 取本地毫秒
-           (depth_service 消费语义: 取不到盘口时间时回退 wall-clock)
+           ask_volumes/bid_volumes, timestamp 取本地毫秒。
+           实现 MarketDataProvider.get_depth_batch 契约(上游 #246 自定义
+           depth 源): depth_service 统一按 capset 切片节流, 失败跳过本轮
+           不跨源回退; 本方法内部再按 50 只/批并发, 单批失败跳过。
 
 核心指数实时行情由 get_realtime_indices(quotes.get_snapshots 按码) 补充。
 北交所 (4/8 开头) 不入网关链路, 逐票跳过并记 warning。
@@ -433,16 +435,19 @@ class EltdxProvider:
                 records.append(rec)
         return records
 
-    # ==================== 实时五档盘口 (depth5 / DepthProvider 契约) ====================
-    def batch(self, symbols: list[str]) -> dict[str, dict]:
-        """批量取实时五档。返回 {symbol: MarketDepth}。
+    # ============ 实时五档盘口 (depth5 / get_depth_batch 契约, 上游 #246) ============
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """批量取实时五档(MarketDataProvider.get_depth_batch 契约)。
 
+        返回 {symbol: MarketDepth}:
         MarketDepth = {
             "ask_volumes": [卖一..卖五量(手)],
             "bid_volumes": [买一..买五量(手)],
             "timestamp": 本地毫秒 epoch,
         }
         与 depth_service._call_depth_batch 的解析结构一致(sealed 只取首档)。
+        切片与节流由 depth_service 统一负责; 本方法内部再按 50 只/批并发,
+        单批失败跳过(不跨源回退)。
         """
         pairs, skipped = _gw_codes_of(list(symbols or []))
         if skipped:
@@ -515,7 +520,7 @@ class EltdxProvider:
             df = pl.DataFrame(records) if records else pl.DataFrame()
             return _preview(self.name, dataset, df)
         if dataset == "depth5":
-            depth = self.batch(symbols)
+            depth = self.get_depth_batch(symbols)
             rows = [
                 {"symbol": sym,
                  "bid1_vol": (d["bid_volumes"] or [None])[0],
