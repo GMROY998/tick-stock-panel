@@ -1,0 +1,15 @@
+# 猫爪 MeoZ — 付费金融数据 API 插件 (https://numcat.net)
+# 纯 HTTP REST 源, 无额外依赖 (runtime: none)。
+# 需配置 MEOZ_API_KEY(环境变量 / .env / 设置页输入框 / ~/.meoz/config.json), 未配置时插件灰显。
+# 线路: 默认公网 numcat.net; 机房近端可设 MEOZ_API_ROUTE=dedicated 走 sz/sh 专线。
+
+name: meoz
+display_name: "猫爪 MeoZ"
+runtime: none
+entry: app.plugins.meoz.provider:MeoZProvider
+check: app.plugins.meoz.provider:availability
+datasets: [daily, adj_factor, minute, realtime, full_minute]
+api_key_env: MEOZ_API_KEY   # 声明后设置页提供 Key 输入框(先探后存, secrets.json 优先)
+description: "猫爪数据 MeoZ 付费 REST API。A 股股票日K(不复权, 按交易日历分片)、除权因子(逐交易日复权因子序列 → 事件日比值, 批量区间查询)、1分钟K(241根/票/日, 逐日多标的批量, 北京时间)、实时行情(tick 全市场快照 + index_snapshot 核心指数)、全量分钟(full_minute 当日修复轮 + 分钟桶增量);ETF/指数盘中分钟未接入时自动回退 TickFlow;全请求内置 ~3QPS 限频与 429 退避。"
+install_hint: "在设置页输入框配置 API Key(https://numcat.net 申请),或在 .env 中配置 MEOZ_API_KEY"
+homepage: "https://numcat.net"
