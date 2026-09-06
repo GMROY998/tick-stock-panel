@@ -1,0 +1,15 @@
+# eltdx-gateway 行情网关插件 (https://github.com/electkismet/eltdx)
+# 直连通达信主站的独立容器网关 (eltdx[http] FastAPI), RPC 风格 HTTP 接口。
+# 纯 HTTP 源, 无额外依赖 (runtime: none)。
+# 网关地址: 环境变量 ELTDX_GATEWAY_URL (默认 http://192.168.1.54:8600),
+# /health 可达即自动可用, 无需 API Key。
+
+name: eltdx
+display_name: "eltdx 行情网关"
+runtime: none
+entry: app.plugins.eltdx.provider:EltdxProvider
+check: app.plugins.eltdx.provider:availability
+datasets: [daily, minute, realtime, depth5]
+description: "eltdx-gateway 通达信行情网关(独立容器, 直连 TDX 主站自动测速选站)。日K(bars.get 不复权, 逐票并发, 大窗口自动分页)、1分钟K(minutes.history 分时价口径: OHLC=分钟价, amount 按价×量估算; TDX 主站 1m K 线缺失最近数日不可用)、实时行情(codes.all_a_shares + 分批快照, 100只/批 ~60ms, 带 open/high/low/昨收, 零价行剔除)、实时五档盘口(quotes.get_depth, 封单监控可切本源, 失败自动回退 TickFlow)。北交所代码不入网关链路。"
+install_hint: "配置环境变量 ELTDX_GATEWAY_URL 指向网关(默认 http://192.168.1.54:8600), 网关容器运行中即自动可用"
+homepage: "https://github.com/electkismet/eltdx"
