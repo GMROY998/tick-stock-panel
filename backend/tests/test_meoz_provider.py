@@ -164,7 +164,7 @@ def test_minute_non_stock_and_wrong_freq_raise():
 # ---------------------------------------------------------------- helpers / surface
 def test_config_datasets_membership():
     prov = MeoZProvider(api_key="test-key")
-    for ds in ("daily", "adj_factor", "minute", "realtime", "full_minute"):
+    for ds in ("daily", "adj_factor", "minute", "realtime", "full_minute", "depth5"):
         assert ds in prov.config.datasets
 
 
@@ -374,3 +374,91 @@ def test_session_label_helpers():
     assert meoz_mod._session_label_count(datetime(2026, 9, 2, 9, 35)) == 6   # 0930~0935
     assert meoz_mod._session_label_count(datetime(2026, 9, 2, 9, 0)) == 0
     assert meoz_mod._session_label_count(datetime(2026, 9, 2, 15, 30)) == 241
+
+
+# ---------------------------------------------------------------- depth5(五档盘口)
+def _l2_row(sym="600000", t="145959000", bid_vol=505700, ask_vol=14300,
+            bid=9.23, ask=9.24):
+    return {"symbol": sym, "time": t, "bid1": bid, "ask1": ask,
+            "bid_vol1": bid_vol, "ask_vol1": ask_vol}
+
+
+def test_depth_batch_maps_latest_valid_snapshot_to_lots():
+    rows = [
+        _l2_row(t="093500000", bid_vol=10000, ask_vol=0),      # 涨停形态: 卖侧空
+        _l2_row(t="145959000", bid_vol=505700, ask_vol=14300),  # 最新有效快照
+        # 盘后定价簿残留(15:00+): 双零空簿, 应被跳过
+        _l2_row(t="151500000", bid_vol=0, ask_vol=0),
+    ]
+
+    def handler(apiname, params):
+        if apiname == "level2_quote_history":
+            assert params["symbol"] == "600000"
+            assert params["end_time"] == meoz_mod._DEPTH_SESSION_END
+            return rows
+
+    prov, client = make_provider(handler)
+    out = prov.get_depth_batch(["600000.SH"])
+    assert list(out) == ["600000.SH"]
+    d = out["600000.SH"]
+    assert d["ask_volumes"] == [143.0, None, None, None, None]  # 股→手
+    assert d["bid_volumes"] == [5057.0, None, None, None, None]
+    assert isinstance(d["timestamp"], int)
+
+
+def test_depth_batch_keeps_limit_board_single_side_zero():
+    """最新快照为涨停形态(卖一无挂单)时保留 0, 不得回退到更早的有效行。"""
+
+    def handler(apiname, params):
+        if apiname == "level2_quote_history":
+            return [
+                _l2_row(t="100000000", bid_vol=9000, ask_vol=8000),
+                _l2_row(t="143000000", bid_vol=999900, ask_vol=0),
+            ]
+
+    prov, _ = make_provider(handler)
+    out = prov.get_depth_batch(["000001.SZ"])
+    d = out["000001.SZ"]
+    assert d["ask_volumes"][0] == 0.0
+    assert d["bid_volumes"][0] == 9999.0
+
+
+def test_depth_batch_empty_book_and_unsupported_codes():
+    def handler(apiname, params):
+        if apiname == "level2_quote_history":
+            if params["symbol"] == "600000":
+                return [_l2_row(bid_vol=0, ask_vol=0)]  # 全天空簿
+            return []  # 无数据
+
+    prov, _ = make_provider(handler)
+    out = prov.get_depth_batch(["600000.SH", "830001.BJ", "600000.SH"])
+    assert out == {}
+
+
+def test_depth_batch_request_failures_are_skipped():
+    calls = {"n": 0}
+
+    def handler(apiname, params):
+        if apiname == "level2_quote_history":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise meoz_mod.MeoZError("boom")
+            return [_l2_row()]
+
+    prov, _ = make_provider(handler)
+    out = prov.get_depth_batch(["600000.SH", "000001.SZ"])
+    assert set(out) == {"000001.SZ"}
+
+
+def test_depth_batch_dedup_and_exchange_suffix():
+    seen: list[str] = []
+
+    def handler(apiname, params):
+        if apiname == "level2_quote_history":
+            seen.append(params["symbol"])
+            return [_l2_row()]
+
+    prov, _ = make_provider(handler)
+    out = prov.get_depth_batch(["600000.SH", "600000"])
+    assert list(out) == ["600000.SH"]
+    assert seen == ["600000"]  # 去重后单次请求, 纯代码入参

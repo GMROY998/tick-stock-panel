@@ -1,19 +1,21 @@
 """eltdx-gateway provider: A 股 日K / 1分钟K / 实时快照 / 实时五档盘口。
 
 数据集契约 (与 kline_sync / quote_service / depth_service 消费端一致):
-- daily    不复权日K: bars.get(period=day, adjust=none) 逐票并发,
-           volume=手(volume_lots) / amount=元, symbol 带交易所后缀回标;
-           窗口 >800 根时 all_pages 分页(网关单页上限 800)
+- daily    不复权日K: bars.get(period=day, adjust=none) **代码列表批量 RPC**
+           (协议逐只请求但由网关内连接池并发调度, 实测 20 只/262 根 0.29s,
+           比逐票 HTTP 快 ~5 倍), volume=手(volume_lots) / amount=元,
+           symbol 带交易所后缀回标; 窗口 >800 根时 all_pages 分页(单页上限 800)
 - minute   1分钟K: minutes.history(trading_date=...) 逐票逐日并发。
            注意: TDX 主站 1m K 线保留约 99 个交易日且**最新若干天缺失**
            (实测 2026-09 bars.get 1m 最新只到 3 个交易日前), 不能用于
            分钟同步; minutes.history 数据实时但只有分钟价与量, 故
            open/high/low 取分钟价(无日内高低), amount 按价×量(手→股)估算。
 - realtime 全市场 A 股快照: codes.all_a_shares + quotes.get_snapshots
-           分批(100/批, 4线程), 失败批串行重试一次; 记录 schema 同 fuyao
-           realtime; change_pct 小数制, 零价行(长期停牌/无行情)剔除,
+           分批(80/批 —— 0x054c 协议单包上限, 实测传 100 只只返回 ~80,
+           早期按 100 切批导致每批静默丢 ~20 只), 失败批串行重试一次;
+           记录 schema 同 fuyao realtime; change_pct 小数制,
+           零价行(长期停牌/无行情, 实测 ~16 只)剔除,
            name/amplitude/turnover_rate 置空(交下游维表)。
-           实测约 1100 只代码无快照行(退市/长期停牌), 属数据源正常行为。
 - depth5   实时五档: quotes.get_depth, sell/buy_levels 五档量(手) →
            ask_volumes/bid_volumes, timestamp 取本地毫秒。
            实现 MarketDataProvider.get_depth_batch 契约(上游 #246 自定义
@@ -44,10 +46,11 @@ logger = logging.getLogger(__name__)
 _DATASETS = ("daily", "minute", "realtime", "depth5")
 
 _MAX_WORKERS = 4          # 网关批量并发(单核限额容器, 并发过高会超时)
-_REALTIME_WORKERS = 2     # 全市场快照专用: 56 批串行 ~60ms/批, 2 并发最少排队不丢批
-_SNAPSHOT_CHUNK = 100     # quotes.get_snapshots 单批代码数(实测 100 只 ~60ms)
+_REALTIME_WORKERS = 3     # 全市场快照专用(70 批 × ~60ms, 3 并发 ~1.5s)
+_SNAPSHOT_CHUNK = 80      # quotes.get_snapshots 单批代码数(0x054c 单包上限, 实测传 100 只只回 ~80)
 _DEPTH_CHUNK = 50         # quotes.get_depth 单批代码数(五档包更大, 取保守值)
-_DAILY_SINGLE_MAX = 800   # bars.get 单请求条数上限(网关 page size 限制)
+_DAILY_SINGLE_MAX = 800   # bars.get 单请求条数上限(协议 page size 上限)
+_DAILY_BATCH = 25         # bars.get 单次 RPC 代码数(网关内连接池并发调度)
 _MINUTE_PER_DAY = 241     # 每交易日 1 分钟桶数(含竞价首根)
 _MINUTE_MAX_DAYS = 120    # get_minute 单次窗口自然日上限(防请求爆炸)
 _DEFAULT_WINDOW_DAYS = 365   # get_daily 未给 start_time 时的回看窗口
@@ -208,7 +211,9 @@ class EltdxProvider:
             logger.warning("eltdx daily 跳过不支持代码(北交所等): %s", skipped[:10])
         count = _trading_days_estimate(start, end) + 10
 
-        # 网关单请求 page size ≤800: 小窗口单请求; 大窗口 all_pages 全量后本地过滤
+        # 协议单页上限 800: 小窗口单页; 大窗口 all_pages 自动翻页后本地过滤。
+        # code 传代码列表: 协议虽逐只请求, 但由网关内连接池并发调度,
+        # 实测 20 只/262 根 0.29s, 比逐票 HTTP RPC 快 ~5 倍。
         params: dict[str, Any] = {"period": "day", "adjust": "none"}
         if count <= _DAILY_SINGLE_MAX:
             params["count"] = count
@@ -216,16 +221,42 @@ class EltdxProvider:
             params["all_pages"] = True
             params["page_size"] = _DAILY_SINGLE_MAX
 
-        rows_all = self._run_per_code(
-            pairs,
-            lambda gw: self._daily_rows(
-                to_symbol(gw),
-                (self._get_client().rpc("bars.get", {"code": gw, **params}) or {}).get("bars") or [],
-                start, end),
-            on_chunk_done,
-        )
+        chunks = [pairs[i:i + _DAILY_BATCH] for i in range(0, len(pairs), _DAILY_BATCH)]
+        rows_all: list[dict[str, Any]] = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=min(self._max_workers, 2)) as pool:
+            futures = {
+                pool.submit(self._fetch_daily_chunk, chunk, params, start, end): chunk
+                for chunk in chunks
+            }
+            for fut in as_completed(futures):
+                done += len(futures[fut])
+                try:
+                    rows_all.extend(fut.result())
+                except EltdxError as e:
+                    logger.warning("eltdx daily 批(%d 只)失败: %s", len(futures[fut]), e)
+                if on_chunk_done:
+                    on_chunk_done(done, len(pairs))
         frames: list[pl.DataFrame] = [pl.DataFrame(rows_all)] if rows_all else []
         return self._finalize(frames, _DAILY_COLS, ["symbol", "date"])
+
+    def _fetch_daily_chunk(
+        self,
+        chunk: list[tuple[str, str]],
+        params: dict[str, Any],
+        start: date,
+        end: date,
+    ) -> list[dict[str, Any]]:
+        """一批代码的 bars.get(代码列表) → 行列表; 响应按 full_code 键回标。"""
+        res = self._get_client().rpc(
+            "bars.get", {"code": [gw for _, gw in chunk], **params}) or {}
+        out: list[dict[str, Any]] = []
+        for key, series in res.items():
+            if not isinstance(series, dict):
+                continue
+            out.extend(self._daily_rows(
+                to_symbol(str(key)), series.get("bars") or [], start, end))
+        return out
 
     @staticmethod
     def _daily_rows(symbol: str, bars: list[dict[str, Any]],

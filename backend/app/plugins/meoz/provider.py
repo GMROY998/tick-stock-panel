@@ -37,7 +37,7 @@ from .client import MeoZClient, MeoZError
 
 logger = logging.getLogger(__name__)
 
-_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute")
+_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute", "depth5")
 
 API_KEY_ENV = "MEOZ_API_KEY"
 SECRETS_FIELD = "meoz_api_key"  # UI 配置的 Key 存 secrets.json, 优先级高于 .env
@@ -51,6 +51,13 @@ _ADJ_TOL = 1e-4               # 除权事件判定阈值(过滤因子序列舍�
 _DAILY_COLS = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
 _ADJ_COLS = ["symbol", "trade_date", "ex_factor"]
 _MINUTE_COLS = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+# depth5(五档盘口) —— level2_quote_history 单票单请求, 取常规时段最新快照的首档。
+# 快照约 3 秒/条; 盘后 15:00+ 会混入盘后定价交易簿(ask=0), 因此 end_time 截到
+# 15:00:10, 定版与盘中轮询读的都是常规时段最后快照。挂单量单位为股, 契约为手。
+_DEPTH2_FIELDS = ["symbol", "time", "bid1", "ask1", "bid_vol1", "ask_vol1"]
+_DEPTH_SESSION_END = "150010"
+_DEPTH_LOTS_PER_SHARE = 100.0
 
 # realtime(实时快照)记录 schema —— 与 fuyao realtime / quote_service 消费端一致
 _SNAPSHOT_RECORD_KEYS = (
@@ -88,6 +95,16 @@ def _remap_symbol(raw: Any, symbol_map: dict[str, str]) -> str:
     if not raw_s:
         return ""
     return symbol_map.get(_strip_exchange(raw_s), raw_s)
+
+
+def _depth_exchange(code: str) -> str:
+    """6 位纯代码 -> 交易所后缀(沪深主板/创业板/科创板; 北交所不支持)。"""
+    if len(code) == 6 and code.isdigit():
+        if code.startswith("6"):
+            return "SH"
+        if code.startswith(("0", "3")):
+            return "SZ"
+    return ""
 
 
 def _parse_date(value: Any) -> date | None:
@@ -733,6 +750,76 @@ class MeoZProvider:
         df = df.with_columns(pl.col("datetime").cast(pl.Datetime("us")))
         return df.select([c for c in _MINUTE_COLS if c in df.columns])
 
+    # ==================== 五档盘口(depth5) ====================
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """批量取五档盘口(MarketDataProvider.get_depth_batch 契约)。
+
+        返回 {symbol: MarketDepth}:
+        MarketDepth = {
+            "ask_volumes": [卖一..卖五量(手)],   # MeoZ 仅取首档, 其余置 None
+            "bid_volumes": [买一..买五量(手)],
+            "timestamp": 本地毫秒 epoch,
+        }
+        level2_quote_history 为单票单请求(不支持多票), 客户端内置 ~3QPS 限频;
+        分片与批次节流由 depth_service 统一负责。每票一次查询, 取常规时段
+        (end_time=15:00:10, 规避盘后定价簿)的最新快照, 只映射买一/卖一。
+        单票失败跳过, 不跨源回退。
+        """
+        uniq = list(dict.fromkeys(_strip_exchange(s) for s in symbols or []))
+        if not uniq:
+            return {}
+        out: dict[str, dict] = {}
+        client = self._get_client()
+        for code in uniq:
+            try:
+                rows = client.rows(
+                    "level2_quote_history",
+                    _DEPTH2_FIELDS,
+                    {"symbol": code, "end_time": _DEPTH_SESSION_END, "page_size": 10000},
+                )
+            except MeoZError as exc:
+                logger.warning("MeoZ depth5 %s 拉取失败: %s", code, exc)
+                continue
+            entry = self._depth_row(code, rows, int(time.time() * 1000))
+            if entry is not None:
+                out[entry[0]] = entry[1]
+        return out
+
+    @staticmethod
+    def _depth_row(code: str, rows: list[dict[str, Any]], fetched_ms: int) -> tuple[str, dict] | None:
+        """常规时段 level2 快照行序列 -> (symbol, MarketDepth); 取时间最大且有效的一行。
+
+        盘中 rows 通常 1 行(节流窗口内最新); 盘后为整日常规时段快照, 取末行
+        (接口时间升序)。买卖两侧同时为 0 为空簿(盘前集合竞价/停牌), 跳过;
+        单侧为 0 是涨停/跌停封板的真实形态, 保留。
+        """
+        best = None
+        best_t = -1
+        for r in rows:
+            try:
+                t = int(str(r.get("time") or "")[:8] or "-1")
+            except ValueError:
+                continue
+            ask_vol = _to_float(r.get("ask_vol1"))
+            bid_vol = _to_float(r.get("bid_vol1"))
+            if ask_vol is None or bid_vol is None:
+                continue
+            if ask_vol <= 0 and bid_vol <= 0:
+                continue
+            if t >= best_t:
+                best_t = t
+                best = (ask_vol, bid_vol)
+        if best is None:
+            return None
+        ask_vol, bid_vol = best
+        ask_lots = ask_vol / _DEPTH_LOTS_PER_SHARE
+        bid_lots = bid_vol / _DEPTH_LOTS_PER_SHARE
+        return f"{code}.{_depth_exchange(code)}", {
+            "ask_volumes": [ask_lots, None, None, None, None],
+            "bid_volumes": [bid_lots, None, None, None, None],
+            "timestamp": fetched_ms,
+        }
+
     # ==================== 设置页“试拉” ====================
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         symbols = (symbols or ["600519.SH"])[:3]
@@ -748,6 +835,12 @@ class MeoZProvider:
             return _preview(self.name, dataset, df)
         elif dataset == "full_minute":
             df = self.get_intraday_batch(symbols)
+        elif dataset == "depth5":
+            batch = self.get_depth_batch(symbols)
+            df = pl.DataFrame(
+                [{"symbol": s, **{k: v for k, v in d.items()}}
+                 for s, d in batch.items()],
+            ) if batch else pl.DataFrame()
         else:
             raise ValueError(f"MeoZ 不支持数据集: {dataset}")
         return _preview(self.name, dataset, df)

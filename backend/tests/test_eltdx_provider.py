@@ -82,8 +82,8 @@ def test_daily_parses_filters_and_maps():
         if method == "bars.get":
             assert params["period"] == "day"
             assert params["adjust"] == "none"
-            assert params["code"] == "sh600519"
-            return {"code": "600519", "bars": bars}
+            assert params["code"] == ["sh600519"]            # 代码列表批量
+            return {"sh600519": {"bars": bars}}
         return None
 
     prov, _ = make_provider(handler)
@@ -97,25 +97,44 @@ def test_daily_parses_filters_and_maps():
     assert df["amount"].to_list() == [pytest.approx(100.5 * 123456), pytest.approx(102.0 * 123456)]
 
 
-def test_daily_non_stock_and_unsupported_codes():
-    def handler(method, params):  # pragma: no cover - 不应被调用
-        raise AssertionError("should not request")
+def test_daily_multi_code_batch_and_unsupported():
+    def handler(method, params):
+        if method == "bars.get":
+            out = {}
+            for gw in params["code"]:
+                out[gw] = {"bars": [_day_bar("2026-08-17", 10.0)]}
+            return out
+        return None
 
     prov, client = make_provider(handler)
     assert prov.get_daily(["510300.SH"], asset_type="etf").height == 0
-    assert not client.calls
+    assert not client.calls                               # 非股票不发请求
 
-    prov2, client2 = make_provider(lambda m, p: {"bars": [_day_bar("2026-08-17", 10.0)]})
-    df = prov2.get_daily(["830799.BJ", "600519.SH"], datetime(2026, 8, 17), datetime(2026, 8, 17))
-    assert df["symbol"].to_list() == ["600519.SH"]   # 北交所跳过
-    assert len(client2.calls) == 1
+    df = prov.get_daily(["830799.BJ", "600519.SH", "000001.SZ"],
+                        datetime(2026, 8, 17), datetime(2026, 8, 17))
+    assert sorted(df["symbol"].unique().to_list()) == ["000001.SZ", "600519.SH"]
+    assert client.calls[0][1]["code"] == ["sh600519", "sz000001"]  # 北交所已剔除
 
 
-def test_daily_per_code_failure_skipped():
+def test_daily_batch_failure_skipped(monkeypatch):
+    monkeypatch.setattr(eltdx_mod, "_DAILY_BATCH", 1)     # 每码一批, 失败互不影响
+
     def handler(method, params):
-        if params.get("code") == "sz000001":
+        if params["code"] == ["sz000001"]:
             raise eltdx_mod.EltdxError("boom")
-        return {"bars": [_day_bar("2026-08-17", 10.0)]}
+        return {params["code"][0]: {"bars": [_day_bar("2026-08-17", 10.0)]}}
+
+    prov, _ = make_provider(handler)
+    df = prov.get_daily(["600519.SH", "000001.SZ"], datetime(2026, 8, 17), datetime(2026, 8, 17))
+    assert df["symbol"].to_list() == ["600519.SH"]
+
+
+def test_daily_missing_code_in_batch_response_tolerated():
+    def handler(method, params):
+        if method == "bars.get":
+            # 停牌代码无返回键 → 静默跳过
+            return {"sh600519": {"bars": [_day_bar("2026-08-17", 10.0)]}}
+        return None
 
     prov, _ = make_provider(handler)
     df = prov.get_daily(["600519.SH", "000001.SZ"], datetime(2026, 8, 17), datetime(2026, 8, 17))
@@ -128,7 +147,7 @@ def test_daily_large_window_uses_all_pages():
     def handler(method, params):
         if method == "bars.get":
             captured.update(params)
-            return {"bars": [_day_bar("2020-01-02", 10.0)]}
+            return {"sh600519": {"bars": [_day_bar("2020-01-02", 10.0)]}}
         return None
 
     prov, _ = make_provider(handler)
@@ -344,7 +363,7 @@ def test_config_datasets_membership():
 def test_test_dataset_shapes():
     def handler(method, params):
         if method == "bars.get" and params["period"] == "day":
-            return {"bars": [_day_bar("2026-08-17", 10.0)]}
+            return {"sh600519": {"bars": [_day_bar("2026-08-17", 10.0)]}}
         if method == "quotes.get_depth":
             return {"records": [_depth_record("600519", "sh", 1, 2)]}
         return None
