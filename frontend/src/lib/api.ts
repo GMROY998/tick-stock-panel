@@ -451,12 +451,26 @@ export interface ScreenerResult {
   elapsed_ms: number
 }
 
+export interface SequentialDiagnostics {
+  kind: 'sequential'
+  pre: string
+  trigger: string
+  max_gap_days: number
+  window: string[]
+  pre_hits: number
+  trigger_hits: number
+  match: number
+  days: { date: string; pre: number; trigger: number; matched: number }[]
+}
+
 export interface ScreenerResultSummary {
   total: number
   as_of: string
   /** 渐进式 run_all 写入的计算时间戳 (Unix ms); 监控实时叠加等来源无此字段 */
   computed_at?: number | null
   available_at?: number | null
+  /** 组合策略诊断 (目前仅 sequential) */
+  diagnostics?: SequentialDiagnostics | null
 }
 
 export interface ScreenerCachedSummary {

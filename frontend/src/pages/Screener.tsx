@@ -32,6 +32,7 @@ import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDial
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
 import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategyDialog'
 import { SequentialStrategyDialog } from '@/components/screener/SequentialStrategyDialog'
+import type { SequentialDiagnostics } from '@/lib/api'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
@@ -163,6 +164,8 @@ export function Screener() {
 
   // 各策略命中数 (进入页面自动跑)
   const [hitCounts, setHitCounts] = useState<Record<string, number>>({})
+  // 顺序策略诊断: 前置/触发/交集, 用于解释 0 命中
+  const [hitDiagnostics, setHitDiagnostics] = useState<Record<string, SequentialDiagnostics>>({})
   // 各策略失效数 (今日曾命中 - 当前命中)
   const [expiredCounts, setExpiredCounts] = useState<Record<string, number>>({})
   // 各策略显示上限 (null = 全部)
@@ -446,10 +449,13 @@ export function Screener() {
       if (data.as_of) setAsOf(data.as_of)
       setPoolScope(data.scope ?? null)
       const counts: Record<string, number> = {}
+      const diags: Record<string, SequentialDiagnostics> = {}
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
+        if (item.diagnostics?.kind === 'sequential') diags[id] = item.diagnostics
       }
       setHitCounts(prev => ({ ...prev, ...counts }))
+      if (Object.keys(diags).length) setHitDiagnostics(prev => ({ ...prev, ...diags }))
       // 渐进式返回: 慢策略后台继续算, 开启摘要轮询逐个点亮
       setPendingRun(
         data.pending?.length
@@ -525,6 +531,7 @@ export function Screener() {
     if (!scopeReady) return
     setPoolScope(null)
     setHitCounts({})
+    setHitDiagnostics({})
     setExpiredCounts({})
     setPendingRun(null)
     setActiveStrategy(null)
@@ -538,9 +545,11 @@ export function Screener() {
     if (!summaryQuery.data || !asOf) return
     const counts: Record<string, number> = {}
     const expired: Record<string, number> = {}
+    const diags: Record<string, SequentialDiagnostics> = {}
     for (const [id, r] of Object.entries(summaryQuery.data.results)) {
       if (r.as_of !== asOf) continue
       counts[id] = r.total
+      if (r.diagnostics?.kind === 'sequential') diags[id] = r.diagnostics
       const everCount = summaryQuery.data.today_ever_counts[id] ?? r.total
       const expiredCount = Math.max(everCount - r.total, 0)
       if (expiredCount > 0) expired[id] = expiredCount
@@ -558,6 +567,7 @@ export function Screener() {
       return next
     })
     setExpiredCounts(expired)
+    setHitDiagnostics(diags)
     // 渐进式: computed_at 晚于本轮起点的策略已算完, 从 pending 中移除;
     // 无 computed_at (监控实时叠加/旧缓存) 视为新鲜。容差吸收前后端时钟差。
     if (pendingRun) {
@@ -1001,6 +1011,7 @@ export function Screener() {
         source={s.source}
         active={activeStrategy === s.id}
         count={hitCounts[id]}
+        diagnostics={hitDiagnostics[id]}
         expiredCount={expiredCounts[id]}
         loading={runAll.isPending}
         computing={pendingRunIds.has(id) || selfRunning || minuteRunning}

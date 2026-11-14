@@ -232,6 +232,9 @@ class StrategyResult:
     scores: dict[str, float] = field(default_factory=dict)
     entry_signal_hits: list[dict] = field(default_factory=list)
     exit_signal_hits: list[dict] = field(default_factory=list)
+    # 组合策略诊断信息 (目前仅 sequential): 前置/触发/交集数量与逐日明细,
+    # 供前端解释"为什么命中 0 只"。
+    diagnostics: dict | None = None
 
 
 @dataclass
@@ -2036,6 +2039,28 @@ class StrategyEngine:
                 return []
             return [h for h in hits if str(h.get("symbol")) in matched]
 
+        pre_all = set().union(*pre_hits.values()) if pre_hits else set()
+        diagnostics = {
+            "kind": "sequential",
+            "pre": pre_id,
+            "trigger": trig_id,
+            "max_gap_days": max_gap,
+            "window": [window[0], window[-1]] if window else [],
+            # 前置在整个窗口内去重命中数; 触发只看当日 (入选日)
+            "pre_hits": len(pre_all),
+            "trigger_hits": len(trig_hits.get(as_of_str, ())),
+            "match": len(matched),
+            "days": [
+                {
+                    "date": day,
+                    "pre": len(pre_hits.get(day, ())),
+                    "trigger": len(trig_hits.get(day, ())),
+                    "matched": len(events.get(day, {})),
+                }
+                for day in window
+            ],
+        }
+
         return StrategyResult(
             as_of=context.as_of,
             strategy_id=strategy_id,
@@ -2049,6 +2074,7 @@ class StrategyEngine:
             exit_signal_hits=_pick_hits(
                 getattr(trigger_result, "exit_signal_hits", None)
             ),
+            diagnostics=diagnostics,
         )
 
     @staticmethod

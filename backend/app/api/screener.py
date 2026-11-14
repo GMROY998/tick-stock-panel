@@ -692,6 +692,8 @@ def get_cached_summary(
             # 前端视为新鲜 (有值即为最新一轮实时结果)
             "computed_at": result.get("computed_at"),
             **({"available_at": result["available_at"]} if result.get("available_at") is not None else {}),
+            # 顺序策略诊断(前置/触发/交集), 供卡片解释 0 命中的原因。
+            **({"diagnostics": result["diagnostics"]} if result.get("diagnostics") else {}),
         }
         for sid, result in results.items()
         if isinstance(result, dict)
@@ -766,6 +768,7 @@ def get_cached_result(
         "rows": _rows_with_ext(raw_result.get("rows") or [], ext_values),
         "total": int(raw_result.get("total") or 0),
         "elapsed_ms": 0.0,
+        "diagnostics": raw_result.get("diagnostics"),
     }
 
     ever_rows = None
@@ -906,9 +909,18 @@ def _run_all_progressive(
                         strategy_ids=[sid], parallel=False,
                     )
                     result = single[sid]
-                    return {"total": result.total, "as_of": str(as_of),
-                            "rows": _safe(asdict(result)).get("rows", []),
-                            "computed_at": int(time.time() * 1000)}
+                    raw = _safe(asdict(result))
+                    return {
+                        "total": result.total,
+                        "as_of": str(as_of),
+                        "rows": raw.get("rows", []),
+                        "computed_at": int(time.time() * 1000),
+                        **(
+                            {"diagnostics": raw["diagnostics"]}
+                            if raw.get("diagnostics")
+                            else {}
+                        ),
+                    }
 
                 payload = copy.deepcopy(screener_work.batch_results.run(
                     (identity, asset_type, timeframe, str(as_of), sid, version),
@@ -1177,7 +1189,15 @@ def run_all(request: Request, body: Optional[dict] = None):
             "as_of": str(as_of),
             "scope": scope,
             "results": {
-                sid: {"total": result["total"], "as_of": result["as_of"]}
+                sid: {
+                    "total": result["total"],
+                    "as_of": result["as_of"],
+                    **(
+                        {"diagnostics": result["diagnostics"]}
+                        if result.get("diagnostics")
+                        else {}
+                    ),
+                }
                 for sid, result in results.items()
             },
             "skipped_unknown": skipped_unknown,

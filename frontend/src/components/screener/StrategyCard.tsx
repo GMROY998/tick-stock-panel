@@ -1,6 +1,7 @@
 import { Settings2, TrendingDown, RadioTower } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { storage } from '@/lib/storage'
+import type { SequentialDiagnostics } from '@/lib/api'
 
 // ===== 卡片尺寸 =====
 
@@ -97,12 +98,15 @@ interface StrategyCardProps {
   computing?: boolean
   /** 等待运行 (自动计算关闭/失败时的分钟策略): 数字未出时显示「待计算」点击引导 */
   awaitRun?: boolean
+  /** 顺序策略诊断 (前置/触发/交集), 用于解释 0 命中 */
+  diagnostics?: SequentialDiagnostics | null
 }
 
 export function StrategyCard({
   name, description, source, active, count, expiredCount,
   loading, cardSize,
   onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, awaitRun,
+  diagnostics,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
@@ -152,6 +156,14 @@ export function StrategyCard({
                 )}
               </div>
             )}
+            {diagnostics?.kind === 'sequential' && (
+              <span
+                className="mt-0.5 text-[9px] text-muted/80 tabular-nums leading-tight"
+                title={`窗口 ${diagnostics.window[0] ?? ''} ~ ${diagnostics.window[1] ?? ''}, 最大间隔 ${diagnostics.max_gap_days} 个交易日`}
+              >
+                前置 {diagnostics.pre_hits} · 触发 {diagnostics.trigger_hits} · 交集 {diagnostics.match}
+              </span>
+            )}
             {count == null && !loading && computing && (
               <span className="mt-1.5 text-sm font-mono font-bold text-muted/50 animate-pulse">···</span>
             )}
@@ -188,6 +200,14 @@ export function StrategyCard({
               )}
               {hasExpired && (
                 <span className="text-[9px] font-mono text-red-400/80">{'-' + expiredCount}</span>
+              )}
+              {diagnostics?.kind === 'sequential' && (
+                <span
+                  className="text-[9px] text-muted/70 tabular-nums shrink-0"
+                  title={`窗口 ${diagnostics.window[0] ?? ''} ~ ${diagnostics.window[1] ?? ''}, 最大间隔 ${diagnostics.max_gap_days} 个交易日`}
+                >
+                  前置{diagnostics.pre_hits}·触发{diagnostics.trigger_hits}·交集{diagnostics.match}
+                </span>
               )}
             </div>
           </button>
