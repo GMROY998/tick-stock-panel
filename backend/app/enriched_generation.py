@@ -125,6 +125,24 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """原子替换; Windows 下对并发读取做短暂退避重试。
+
+    Windows 的 MoveFileEx 在目标文件被其他句柄以不含 FILE_SHARE_DELETE 的方式
+    打开时会返回 ERROR_ACCESS_DENIED (WinError 5)。标记与 enriched 分区是高频
+    读取对象 (API 轮询、矩阵扫描), 读句柄存活时间很短, 退避重试即可避开竞态。
+    """
+    attempts = 20 if os.name == "nt" else 1
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05)
+
+
 def _write_marker(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -133,7 +151,7 @@ def _write_marker(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, stream, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -524,7 +542,7 @@ class EnrichedPublication:
         temporary = out.with_name(f".{out.name}.{uuid.uuid4().hex}.tmp")
 
         def _replace() -> None:
-            os.replace(temporary, out)
+            _replace_with_retry(temporary, out)
             self._changed = True
             self._record_changed_partition(df, out)
             _fsync_directory(out.parent)
