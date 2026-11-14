@@ -162,6 +162,9 @@ class StrategyDataContext:
     # 供分钟策略叠加日线维度条件 (如 N 日内涨停过); 未声明时为 None。
     daily_history: pl.DataFrame | None = None
     market: Any | None = None
+    # 顺序策略的分钟触发段 (最后一段为 minute_filter) 专用: 装配方注入 as_of
+    # 当日的分钟上下文, 日线上下文本身不受影响。
+    minute: Any | None = None
     cache_key: str | None = None
     # enriched 数据换代号 (repo.get_matrix_data_generation, 详见 enriched_generation):
     # 装配方填入, 消费方用作共享矩阵缓存的失效指纹 — 数据重建换代号变, 缓存自动失效。
@@ -453,6 +456,7 @@ class StrategyEngine:
         spec = strategy.sequential
         parent_assets = list(strategy.meta.get("asset_types", ["stock"]))
         parent_timeframes = list(strategy.meta.get("timeframes", ["1d"]))
+        last_index = len(spec.stages) - 1
         for index, child_id in enumerate(spec.stages):
             role = f"第{index + 1}段"
             child_def = candidates.get(child_id)
@@ -463,10 +467,11 @@ class StrategyEngine:
                     f"sequential strategy {sid} 引用的{role}策略 {child_id!r} "
                     f"也是组合策略; 禁止嵌套"
                 )
-            if child_def.execution_backend == "minute_filter":
+            is_minute = child_def.execution_backend == "minute_filter"
+            if is_minute and index != last_index:
                 return (
                     f"sequential strategy {sid} 的{role}策略 {child_id!r} 是分钟策略; "
-                    f"顺序策略首版仅支持日线"
+                    f"分钟策略只能作为最后一段(触发段)"
                 )
             child_assets = list(child_def.meta.get("asset_types", ["stock"]))
             if not set(parent_assets).issubset(set(child_assets)):
@@ -474,6 +479,14 @@ class StrategyEngine:
                     f"sequential strategy {sid} 的 asset_types {parent_assets} "
                     f"未被子策略 {child_id!r} 完全支持(支持 {child_assets})"
                 )
+            if is_minute:
+                # 分钟触发段的时间周期是 1m, 与父级 1d 不构成子集关系, 单独校验
+                if child_def.meta.get("timeframes") != ["1m"]:
+                    return (
+                        f"sequential strategy {sid} 的分钟触发段 {child_id!r} "
+                        f"必须声明 timeframes == ['1m']"
+                    )
+                continue
             child_timeframes = list(child_def.meta.get("timeframes", ["1d"]))
             if not set(parent_timeframes).issubset(set(child_timeframes)):
                 return (
@@ -849,6 +862,28 @@ class StrategyEngine:
             if strategy.execution_backend == "minute_filter":
                 required = max(required, strategy.minute_daily_bars)
         return required
+
+    def minute_trigger_ids(self, strategy_ids: list[str]) -> list[str]:
+        """顺序策略中作为最后一段(触发段)的分钟策略 id 列表。
+
+        装配方据此为 as_of 当日额外构建分钟上下文 (context.minute)。
+        """
+        ids: list[str] = []
+        for strategy_id in strategy_ids:
+            try:
+                strategy = self.get(strategy_id)
+            except ValueError:
+                continue
+            if strategy.execution_backend != "sequential" or strategy.sequential is None:
+                continue
+            last = strategy.sequential.stages[-1]
+            try:
+                child = self.get(last)
+            except ValueError:
+                continue
+            if child.execution_backend == "minute_filter" and last not in ids:
+                ids.append(last)
+        return ids
 
     def required_history_bars(
         self,
@@ -1228,6 +1263,7 @@ class StrategyEngine:
         if s.filter_fn:
             expr = s.filter_fn(df, params)
             df = df.filter(expr)
+
 
         # Stage 2.5: 叠加条件 (每策略 overlay 硬过滤) — 策略过滤之后、评分之前:
         # 评分 min-max 归一化与 limit 截断都在过滤后的候选上进行; exit_signal_hits
@@ -1993,6 +2029,18 @@ class StrategyEngine:
             expr = pl.col("__seq_day")
             return labeled.filter(expr <= day if upto else expr == day)
 
+        # 最后一段允许是分钟策略: 只回放 as_of 当日 (分钟分区只加载当日),
+        # 前面的段仍是日线, 逐日回放。
+        minute_trigger: str | None = None
+        try:
+            last_def = self.get(stages[-1])
+        except ValueError:
+            last_def = None
+        if last_def is not None and last_def.execution_backend == "minute_filter":
+            minute_trigger = stages[-1]
+        daily_stages = stages[:-1] if minute_trigger else stages
+        minute_data_missing = False
+
         hits_by_stage: list[dict[str, set[str]]] = [{} for _ in range(n_stages)]
         stage_results: list[dict[str, StrategyResult]] = [{} for _ in range(n_stages)]
         for day in window:
@@ -2003,7 +2051,8 @@ class StrategyEngine:
                 history=_window_frame(day, upto=True),
                 market=None,
             )
-            for stage_index, cid in enumerate(stages):
+            for cid in daily_stages:
+                stage_index = stages.index(cid)
                 child_ctx = replace(base_ctx, market=child_markets.get(cid))
                 result = self.run(
                     cid,
@@ -2014,6 +2063,32 @@ class StrategyEngine:
                 )
                 hits_by_stage[stage_index][day] = seq_mod.result_symbols(result)
                 stage_results[stage_index][day] = result
+
+            if minute_trigger is not None and day == as_of_str:
+                minute_ctx = context.minute
+                if minute_ctx is None:
+                    raise ValueError(
+                        f"sequential strategy {strategy_id} 的分钟触发段缺少分钟数据上下文"
+                    )
+                minute_history = getattr(minute_ctx, "history", None)
+                minute_missing = minute_history is None or (
+                    hasattr(minute_history, "is_empty") and minute_history.is_empty()
+                )
+                if minute_missing:
+                    # 当日无分钟分区: 视为无触发, 不跨日期回退 (与日线链同一天)
+                    minute_data_missing = True
+                    hits_by_stage[-1][day] = set()
+                else:
+                    minute_ctx = replace(minute_ctx, as_of=date.fromisoformat(day))
+                    result = self.run(
+                        minute_trigger,
+                        minute_ctx,
+                        pool=pool,
+                        params=None,
+                        overrides=child_overrides[minute_trigger],
+                    )
+                    hits_by_stage[-1][day] = seq_mod.result_symbols(result)
+                    stage_results[-1][day] = result
 
         events = seq_mod.match_events(window, hits_by_stage, min_gaps, max_gaps)
         matched = events.get(as_of_str) or {}
@@ -2070,6 +2145,12 @@ class StrategyEngine:
             "min_gaps": min_gaps,
             "max_gaps": max_gaps,
             "window": [window[0], window[-1]] if window else [],
+            **(
+                {"minute_trigger": minute_trigger,
+                 "minute_data_missing": minute_data_missing}
+                if minute_trigger
+                else {}
+            ),
             # 兼容旧前端字段: 第一段窗口内去重命中 / 最后一段当日命中 / 最终交集
             "pre": stages[0],
             "trigger": stages[-1],

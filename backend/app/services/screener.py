@@ -467,8 +467,13 @@ class ScreenerService:
         current: pl.DataFrame | None = None,
         market=None,
         cache_key: str | None = None,
+        minute_strict: bool = False,
     ):
-        """按调用方要求装配标准策略数据上下文，不解释策略公式。"""
+        """按调用方要求装配标准策略数据上下文，不解释策略公式。
+
+        minute_strict: 1m 分支只认 as_of 当日分区, 缺失时返回空帧而不回退到
+        最近分区 — 顺序策略的分钟触发段必须与日线链同一天, 不能混日期。
+        """
         from app.strategy.engine import StrategyDataContext
 
         self._assert_integrity(as_of)
@@ -477,7 +482,9 @@ class ScreenerService:
         if timeframe == "1m":
             # 分钟策略数据源是本地当日分钟K分区 (单分区文件直读), 与日线
             # enriched 历史窗口无关, 不走 required_history_bars 日线路径。
-            history = self._load_minute_history(as_of, current)
+            history = self._load_minute_history(
+                as_of, current, strict=minute_strict
+            )
             # 策略声明 META["daily_history_bars"] 时额外装配日线 enriched 窗口,
             # 供分钟策略叠加日线维度条件 (如 N 日内涨停过)。
             daily_history = None
@@ -509,6 +516,23 @@ class ScreenerService:
             data_generation = self.repo.get_matrix_data_generation(self.asset_type)
         except Exception:  # noqa: BLE001
             data_generation = None
+        # 顺序策略的分钟触发段: 额外装配 as_of 当日的分钟上下文。
+        minute_ctx = None
+        if engine is not None:
+            try:
+                minute_ids = engine.minute_trigger_ids(strategy_ids)
+            except Exception:  # noqa: BLE001
+                minute_ids = []
+            if minute_ids:
+                minute_ctx = self.build_strategy_context(
+                    engine,
+                    as_of,
+                    minute_ids,
+                    timeframe="1m",
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                    minute_strict=True,
+                )
         return StrategyDataContext(
             asset_type=self.asset_type,
             timeframe=timeframe,
@@ -516,11 +540,14 @@ class ScreenerService:
             current=current,
             history=history,
             market=market,
+            minute=minute_ctx,
             cache_key=cache_key,
             data_generation=data_generation,
         )
 
-    def _load_minute_history(self, as_of: date, current: pl.DataFrame | None) -> pl.DataFrame:
+    def _load_minute_history(
+        self, as_of: date, current: pl.DataFrame | None, *, strict: bool = False
+    ) -> pl.DataFrame:
         """分钟策略数据源: 优先 as_of 当日分钟分区, 缺失时回退全市场最近分区。
 
         只按日期直读单个分区文件 (get_minute_by_dates), 与全量 glob 扫描解耦,
@@ -536,6 +563,16 @@ class ScreenerService:
             return pl.DataFrame()
         df = self.repo.get_minute_by_dates(symbols, [as_of])
         if df.is_empty():
+            logger.debug(
+                "分钟数据为空 as_of=%s symbols=%d strict=%s latest=%s",
+                as_of,
+                len(symbols),
+                strict,
+                getattr(self.repo, "latest_minute_date_global", lambda: None)(),
+            )
+            if strict:
+                # 顺序策略的分钟触发段: 当日无分区即视为无命中, 不跨日期回退
+                return pl.DataFrame()
             fallback = self.repo.latest_minute_date_global()
             if fallback is None:
                 raise ValueError(

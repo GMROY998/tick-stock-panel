@@ -45,6 +45,41 @@ def test_parse_spec_rejects_invalid():
         )  # min > max
 
 
+# ---------------------------------------------------------------- 引用校验
+def _stage_def(sid: str, backend: str, timeframes: list[str]):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=sid,
+        execution_backend=backend,
+        meta={"id": sid, "asset_types": ["stock"], "timeframes": timeframes},
+        sequential=None,
+    )
+
+
+def test_validate_allows_minute_only_as_last_stage():
+    from types import SimpleNamespace
+
+    from app.strategy.engine import StrategyEngine
+
+    daily = _stage_def("d", "polars_expr", ["1d"])
+    minute = _stage_def("m", "minute_filter", ["1m"])
+    candidates = {"d": daily, "m": minute}
+
+    spec = seq.parse_spec({"stages": ["d", "m"], "min_gaps": [0], "max_gaps": [2]})
+    strategy = SimpleNamespace(
+        sequential=spec, meta={"asset_types": ["stock"], "timeframes": ["1d"]}
+    )
+    assert StrategyEngine._validate_sequential_references("s", strategy, candidates) is None
+
+    spec2 = seq.parse_spec({"stages": ["m", "d"], "min_gaps": [0], "max_gaps": [2]})
+    strategy2 = SimpleNamespace(
+        sequential=spec2, meta={"asset_types": ["stock"], "timeframes": ["1d"]}
+    )
+    error = StrategyEngine._validate_sequential_references("s2", strategy2, candidates)
+    assert error is not None and "最后一段" in error
+
+
 # ---------------------------------------------------------------- 状态机
 def test_match_events_two_stage_window():
     dates = ["d0", "d1", "d2", "d3"]

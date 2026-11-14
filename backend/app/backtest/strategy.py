@@ -1612,6 +1612,15 @@ class StrategyBacktestService:
                     asset_type=config.asset_type,
                 )
             elif s.execution_backend == "sequential":
+                # 分钟触发段需要逐日分钟回放, 首版未接入回测 — fail-closed,
+                # 避免用日线面板把分钟段当成"恒真"算出错误结果。
+                if s.sequential is not None:
+                    last_def = self.strategy_engine.get(s.sequential.stages[-1])
+                    if last_def.execution_backend == "minute_filter":
+                        return _err(
+                            "含分钟触发段的顺序策略暂不支持回测: "
+                            "分钟段只在选股/监控中按当日分钟K回放"
+                        )
                 # 全部段都是矩阵策略 → 走矩阵路径(向量化);
                 # 含 polars_expr / 历史形态策略 → 走面板路径。
                 stage_defs = [

@@ -1473,8 +1473,13 @@ def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Reque
             raise ValueError(f"{role}策略 {cid!r} 不存在") from exc
         if child_def.execution_backend in ("composite", "sequential"):
             raise ValueError(f"{role}策略 {cid!r} 也是组合策略; 禁止嵌套")
-        if child_def.execution_backend == "minute_filter":
-            raise ValueError(f"{role}策略 {cid!r} 是分钟策略; 顺序策略仅支持日线")
+        if (
+            child_def.execution_backend == "minute_filter"
+            and index != len(stages) - 1
+        ):
+            raise ValueError(
+                f"{role}策略 {cid!r} 是分钟策略; 分钟策略只能作为最后一段(触发段)"
+            )
 
     code = _render_sequential_code(
         sid,

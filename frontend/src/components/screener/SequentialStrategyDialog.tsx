@@ -36,14 +36,13 @@ export function SequentialStrategyDialog({ open, onClose, onSavedId, editStrateg
     enabled: open,
   })
 
-  // 子策略只能是日线叶子策略: 排除叠加/顺序 (source=composite) 与分钟策略
+  // 子策略: 排除叠加/顺序 (source=composite)。分钟策略只能放在最后一段(触发段)。
   const available = useMemo(
-    () =>
-      (availableQuery.data?.presets ?? []).filter(
-        s => s.source !== 'composite' && !s.timeframes?.includes('1m'),
-      ),
+    () => (availableQuery.data?.presets ?? []).filter(s => s.source !== 'composite'),
     [availableQuery.data],
   )
+  const isMinuteStrategy = (id: string) =>
+    available.find(s => s.id === id)?.timeframes?.includes('1m') ?? false
 
   useEffect(() => {
     if (!open) return
@@ -119,6 +118,10 @@ export function SequentialStrategyDialog({ open, onClose, onSavedId, editStrateg
       setError('同一策略不能重复出现在多个段')
       return
     }
+    if (stages.some((id, i) => i < stages.length - 1 && isMinuteStrategy(id))) {
+      setError('分钟策略只能作为最后一段（触发段）')
+      return
+    }
     for (let i = 0; i < minGaps.length; i += 1) {
       if (minGaps[i] > maxGaps[i]) {
         setError(`第 ${i + 1} 段间隔：最小不能大于最大`)
@@ -148,7 +151,13 @@ export function SequentialStrategyDialog({ open, onClose, onSavedId, editStrateg
 
   const stageOptions = (index: number) => {
     const used = new Set(stages.filter((_, i) => i !== index && stages[i]))
-    return available.filter(s => !used.has(s.id))
+    const isLast = index === stages.length - 1
+    return available.filter(s => {
+      if (used.has(s.id)) return false
+      // 分钟策略只能放在最后一段(触发段)
+      if (!isLast && s.timeframes?.includes('1m')) return false
+      return true
+    })
   }
 
   return (
@@ -236,7 +245,8 @@ export function SequentialStrategyDialog({ open, onClose, onSavedId, editStrateg
                         <option value="">请选择策略…</option>
                         {stageOptions(index).map((s: ScreenerStrategy) => (
                           <option key={s.id} value={s.id}>
-                            {s.name}（{s.id}）
+                            {s.name}
+                            {s.timeframes?.includes('1m') ? '（分钟触发）' : ''}（{s.id}）
                           </option>
                         ))}
                       </select>
@@ -294,6 +304,7 @@ export function SequentialStrategyDialog({ open, onClose, onSavedId, editStrateg
                 判定：从第 1 段开始逐段推进，相邻段命中日必须落在各自的最小~最大间隔内（交易日）。
                 同一天可连续推进（间隔 0，需最小间隔为 0）。最后一段命中日即入选日，评分取最后一段，
                 结果附带每段实际间隔与总间隔。
+                最后一段可用分钟策略作为盘中触发（仅回放当日分钟数据），前面的段仍按日线推进。
               </div>
 
               {error && (
