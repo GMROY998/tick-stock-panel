@@ -35,6 +35,40 @@ def _admit_submission(request: Request) -> None:
     admit_request(request, COOKIE_NAME)
 
 
+def _normalize_pool(raw: Any) -> list[str] | None:
+    """规范化股票池入参: 去空、转大写、去重保序。
+
+    约定: None = 全市场 (未传/不限定); 空列表 = 明确选了空集合 (如空自选分组),
+    必须返回 0 命中, 不能退化成全市场。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return None
+    seen: list[str] = []
+    for item in raw:
+        value = str(item or "").strip().upper()
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def _pool_scope(pool: list[str]) -> str:
+    """股票池作用域键: 排序后取 sha1 前 16 位, 保证同一集合稳定。"""
+    import hashlib
+
+    joined = ",".join(sorted(pool))
+    return "pool:" + hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def _scoped_bucket(request: Request, scope: str) -> dict:
+    """读取池化缓存桶; 缺失时返回空结构 (绝不回退到全市场缓存)。"""
+    bucket = strategy_cache.read_scoped(request.app.state.repo.store.data_dir, scope)
+    if isinstance(bucket, dict):
+        return bucket
+    return {"as_of": None, "results": {}, "updated_at": None}
+
+
 class CustomRequest(BaseModel):
     conditions: list[str]
     order_by: Optional[str] = None
@@ -603,6 +637,7 @@ def _cached_with_realtime(request: Request) -> dict:
 def get_cached(
     request: Request,
     ext_columns: Optional[str] = Query(None, description="逗号分隔: config_id.field_name"),
+    scope: Optional[str] = None,
 ):
     """读取策略结果缓存, 并叠加监控引擎本轮实时算出的结果。
 
@@ -613,7 +648,7 @@ def get_cached(
     - 价格类展示字段统一用当前实时快照覆盖 (同日才覆盖), 避免列表显示扫描时刻
       价格、详情显示实时价格造成的"同一只票两个涨幅"。
     """
-    cached = _cached_with_live_quotes(request)
+    cached = _scoped_bucket(request, scope) if scope else _cached_with_live_quotes(request)
 
     # 无任何数据 (盘后缓存空 + 无实时结果) → 返回空标记, 前端据此提示
     if not cached.get("results") and cached.get("as_of") is None:
@@ -638,12 +673,16 @@ def get_cached(
 
 
 @router.get("/cached-summary")
-def get_cached_summary(request: Request, task_id: str | None = None):
+def get_cached_summary(
+    request: Request,
+    task_id: str | None = None,
+    scope: Optional[str] = None,
+):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
     # Observe task completion before reading its published cache, so a result
     # committed during this request cannot stop polling with an older snapshot.
-    task = strategy_run_queue.MANAGER.task_status(task_id) if task_id else None
-    cached = _cached_with_realtime(request)
+    task = strategy_run_queue.MANAGER.task_status(task_id) if task_id and not scope else None
+    cached = _scoped_bucket(request, scope) if scope else _cached_with_realtime(request)
     results = cached.get("results") or {}
     summary = {
         sid: {
@@ -674,15 +713,16 @@ def get_cached_summary(request: Request, task_id: str | None = None):
     # 分钟策略结果不落 strategy_cache (日线语义), 渐进式转后台算完后在这里
     # 以 handle 快照合入 (仅 as_of 与日线缓存同日的), 前端轮询本端点点亮卡片。
     minute_pending: list[str] = []
-    identity = screener_work.hard_identity(request.app.state.repo, getattr(request.app.state, "strategy_engine", None), "stock")
-    for m in strategy_run_queue.MANAGER.minute_summaries(identity=identity, asset_type="stock"):
-        if m.get("as_of") != cached_as_of:
-            continue
-        for sid, item in (m.get("results") or {}).items():
-            previous = summary.get(sid) or {}
-            if (item.get("computed_at") or 0) >= (previous.get("computed_at") or 0):
-                summary[sid] = item
-        minute_pending.extend(m.get("pending") or [])
+    if not scope:
+        identity = screener_work.hard_identity(request.app.state.repo, getattr(request.app.state, "strategy_engine", None), "stock")
+        for m in strategy_run_queue.MANAGER.minute_summaries(identity=identity, asset_type="stock"):
+            if m.get("as_of") != cached_as_of:
+                continue
+            for sid, item in (m.get("results") or {}).items():
+                previous = summary.get(sid) or {}
+                if (item.get("computed_at") or 0) >= (previous.get("computed_at") or 0):
+                    summary[sid] = item
+            minute_pending.extend(m.get("pending") or [])
 
     return {
         "as_of": cached_as_of,
@@ -699,13 +739,14 @@ def get_cached_result(
     strategy_id: str,
     request: Request,
     ext_columns: Optional[str] = Query(None, description="逗号分隔: config_id.field_name"),
+    scope: Optional[str] = None,
 ):
     """按需返回单个策略的完整明细及其今日失效行。
 
     与 /cached 一致: 价格类展示字段用当前实时快照覆盖 (同日才覆盖), 保证
     详情里的涨跌幅与列表、以及个股详情弹窗同源。
     """
-    cached = _cached_with_live_quotes(request)
+    cached = _scoped_bucket(request, scope) if scope else _cached_with_live_quotes(request)
     raw_result = (cached.get("results") or {}).get(strategy_id)
     if not isinstance(raw_result, dict):
         return {
@@ -954,6 +995,8 @@ def run_all(request: Request, body: Optional[dict] = None):
     t_total = time.perf_counter()
 
     body = body or {}
+    pool = _normalize_pool(body.get("pool"))
+    scope = _pool_scope(pool) if pool is not None else None
     repo = request.app.state.repo
     asset_type = str(body.get("asset_type") or "stock")
     timeframe = str(body.get("timeframe") or "1d")
@@ -978,6 +1021,16 @@ def run_all(request: Request, body: Optional[dict] = None):
         as_of = svc.latest_date()
     if not as_of:
         return {"as_of": None, "results": {}}
+    # 明确选了空池 (如空自选分组): 0 命中, 不能退化成全市场。
+    if pool is not None and not pool:
+        return {
+            "as_of": str(as_of),
+            "scope": scope,
+            "results": {},
+            "pending": [],
+            "complete": True,
+            "skipped_unknown": [],
+        }
 
     data_dir = request.app.state.repo.store.data_dir
 
@@ -1027,7 +1080,9 @@ def run_all(request: Request, body: Optional[dict] = None):
     # 日线与分钟都启用: 分钟策略结果不落盘, 后台算完经 handle 快照合入
     # cached-summary (见 get_cached_summary) — 请求不再整段占用线程等计算。
     first_return_s = settings.strategy_run_all_first_return_s
-    if body.get("summary_only") and first_return_s > 0:
+    # 股票池运行强制同步返回: 池子通常只有几十~几百只, 计算很快; 且渐进式路径
+    # 会把结果逐条写进全市场缓存, 与池化作用域隔离的目标冲突。
+    if body.get("summary_only") and first_return_s > 0 and pool is None:
         progressive = _run_all_progressive(
             repo=repo,
             engine=engine,
@@ -1055,13 +1110,24 @@ def run_all(request: Request, body: Optional[dict] = None):
         with strategy_run_queue.MANAGER.execution():
             context = svc.build_strategy_context(engine, as_of, all_ids, timeframe=timeframe,
                                                  params_map=params_map, overrides_map=overrides_map)
-            result = engine.run_all(context, params_map=params_map, overrides_map=overrides_map, strategy_ids=all_ids)
+            run_kwargs: dict[str, Any] = {}
+            if pool is not None:
+                # 仅在限定股票池时传参: 兼容测试替身/旧 engine 实现
+                run_kwargs["pool"] = pool
+            result = engine.run_all(
+                context,
+                params_map=params_map,
+                overrides_map=overrides_map,
+                strategy_ids=all_ids,
+                **run_kwargs,
+            )
             screener_work.assert_current(repo, engine, asset_type, identity)
             return result
 
     try:
         engine_results = screener_work.full_batch_work.run(
-            (identity, asset_type, timeframe, str(as_of), tuple(sorted(all_ids)), version), compute,
+            (identity, asset_type, timeframe, str(as_of), tuple(sorted(all_ids)), tuple(sorted(pool)) if pool else (), version),
+            compute,
             ttl_s=6 if body.get("ensure") is True else 0,
         )
     except ValueError as e:
@@ -1087,11 +1153,18 @@ def run_all(request: Request, body: Optional[dict] = None):
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
     # 写入策略缓存 (供页面秒加载); 分钟周期结果不落盘 (日线语义缓存)
+    # 池化运行写独立的作用域文件, 绝不覆盖全市场 strategy_cache.json。
     if results and timeframe == "1d":
         try:
-            strategy_cache.write_cache(data_dir, str(as_of), results,
-                                       validate=lambda: screener_work.assert_current(repo, engine, asset_type, identity),
-                                       strict=True)
+            if scope:
+                strategy_cache.write_scoped(
+                    data_dir, scope, str(as_of), results,
+                    validate=lambda: screener_work.assert_current(repo, engine, asset_type, identity),
+                )
+            else:
+                strategy_cache.write_cache(data_dir, str(as_of), results,
+                                           validate=lambda: screener_work.assert_current(repo, engine, asset_type, identity),
+                                           strict=True)
         except WorkBusyError:
             raise
         except Exception as exc:  # Legacy full-detail callers still receive computed rows.
@@ -1102,6 +1175,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     if body.get("summary_only"):
         return {
             "as_of": str(as_of),
+            "scope": scope,
             "results": {
                 sid: {"total": result["total"], "as_of": result["as_of"]}
                 for sid, result in results.items()
@@ -1113,6 +1187,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of=str(as_of))
     return {
         "as_of": str(as_of),
+        "scope": scope,
         "results": _results_with_ext(results, ext_values),
         "skipped_unknown": skipped_unknown,
     }

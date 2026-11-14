@@ -1254,6 +1254,7 @@ class StrategyEngine:
         *,
         strategy_ids: list[str] | None = None,
         parallel: bool = True,
+        pool: list[str] | None = None,
     ) -> dict[str, StrategyResult]:
         """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。
 
@@ -1261,10 +1262,24 @@ class StrategyEngine:
         (polars 计算释放 GIL), 并发不改变结果, 逐策略耗时日志不变。composite
         子策略的递归 run_all 以 parallel=False 调用, 保证嵌套时线程总数仍
         不超过 worker 上限, 不随叠加层数放大。
+
+        pool: 限定股票池 (如自选分组)。在批量入口先裁剪一次当前帧, 再透传给
+        每个策略 — 与单策略 engine.run(pool=...) 同口径 (matrix_native 走
+        asset_mask)。None/空 表示全市场。
         """
         if context.current is None:
             raise ValueError("strategy run_all context requires current data")
         df = context.current
+        pool_symbols: list[str] | None = None
+        if pool:
+            pool_symbols = [str(item) for item in pool if item]
+            if pool_symbols:
+                df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(pool_symbols))
+                if df.is_empty():
+                    logger.info("run_all: 股票池过滤后无标的 (pool=%d), 返回空结果", len(pool_symbols))
+                    return {}
+            else:
+                pool_symbols = None
         params_map = params_map or {}
         overrides_map = overrides_map or {}
         selected_ids = list(self._strategies) if strategy_ids is None else strategy_ids
@@ -1302,6 +1317,7 @@ class StrategyEngine:
                 ),
                 params=params_map.get(sid),
                 overrides=overrides_map.get(sid),
+                pool=pool_symbols,
             )
             elapsed_ms = (time.perf_counter() - started) * 1000
             # >=1s 打 INFO 供热点归因 (哪些策略吃掉了 run_all 的大头), 其余 DEBUG 防噪。

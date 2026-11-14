@@ -472,6 +472,8 @@ export interface ScreenerCachedSummary {
 /** run_all 渐进式返回: 快策略已算完, 慢策略后台继续算 */
 export interface ScreenerRunAllSummary {
   as_of: string | null
+  /** 股票池作用域键 (仅池化运行返回; 全市场为 null) */
+  scope?: string | null
   results: Record<string, ScreenerResultSummary>
   /** 尚未算完的策略 (后台继续, 逐个写入缓存) */
   pending?: string[]
@@ -3665,24 +3667,35 @@ export const api = {
       timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
       body: JSON.stringify({ conditions, order_by: orderBy, limit, pool, ext_columns: extColumns || null, asset_type: assetType }),
     }),
-  screenerRunAll: (asOf?: string, strategyIds?: string[], assetType: 'stock' | 'etf' = 'stock', timeframe: '1d' | '1m' = '1d', ensure = false) =>
+  screenerRunAll: (asOf?: string, strategyIds?: string[], assetType: 'stock' | 'etf' = 'stock', timeframe: '1d' | '1m' = '1d', ensure = false, pool?: string[]) =>
     request<ScreenerRunAllSummary>(
-      '/api/screener/run_all', { method: 'POST', timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS, body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe, summary_only: true, ensure }) },
+      '/api/screener/run_all', { method: 'POST', timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS, body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe, summary_only: true, ensure, pool: pool === undefined ? null : pool }) },
     ),
-  screenerCachedSummary: (taskId?: string) =>
-    request<ScreenerCachedSummary>('/api/screener/cached-summary' + (taskId ? `?task_id=${encodeURIComponent(taskId)}` : '')),
-  screenerCachedResult: (strategyId: string, extColumns?: string) =>
-    request<ScreenerCachedResult>(
-      extColumns
-        ? `/api/screener/cached-result/${encodeURIComponent(strategyId)}?ext_columns=${encodeURIComponent(extColumns)}`
-        : `/api/screener/cached-result/${encodeURIComponent(strategyId)}`,
-    ),
-  screenerCached: (extColumns?: string) =>
-    request<{ as_of: string | null; results: Record<string, { total: number; as_of: string; rows: any[] }>; today_ever_matched: Record<string, string[]> | null; today_ever_rows: Record<string, Record<string, any>> | null; updated_at: number | null }>(
-      extColumns
-        ? `/api/screener/cached?ext_columns=${encodeURIComponent(extColumns)}`
-        : '/api/screener/cached',
-    ),
+  screenerCachedSummary: (taskId?: string, scope?: string | null) => {
+    const qs = new URLSearchParams()
+    if (taskId) qs.set('task_id', taskId)
+    if (scope) qs.set('scope', scope)
+    const suffix = qs.toString()
+    return request<ScreenerCachedSummary>('/api/screener/cached-summary' + (suffix ? `?${suffix}` : ''))
+  },
+  screenerCachedResult: (strategyId: string, extColumns?: string, scope?: string | null) => {
+    const qs = new URLSearchParams()
+    if (extColumns) qs.set('ext_columns', extColumns)
+    if (scope) qs.set('scope', scope)
+    const suffix = qs.toString()
+    return request<ScreenerCachedResult>(
+      `/api/screener/cached-result/${encodeURIComponent(strategyId)}` + (suffix ? `?${suffix}` : ''),
+    )
+  },
+  screenerCached: (extColumns?: string, scope?: string | null) => {
+    const qs = new URLSearchParams()
+    if (extColumns) qs.set('ext_columns', extColumns)
+    if (scope) qs.set('scope', scope)
+    const suffix = qs.toString()
+    return request<{ as_of: string | null; results: Record<string, { total: number; as_of: string; rows: any[] }>; today_ever_matched: Record<string, string[]> | null; today_ever_rows: Record<string, Record<string, any>> | null; updated_at: number | null }>(
+      '/api/screener/cached' + (suffix ? `?${suffix}` : ''),
+    )
+  },
   marketSnapshot: () =>
     request<{ as_of: string | null; rows: MarketSnapshotRow[] }>('/api/screener/market-snapshot'),
   overviewMarket: (asOf?: string) => request<OverviewMarket>(`/api/overview/market${asOf ? `?as_of=${asOf}` : ''}`),

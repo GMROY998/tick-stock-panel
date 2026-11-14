@@ -53,6 +53,11 @@ export function Screener() {
   // 周期显示筛选: 全部 / 日线 / 分钟 — 只过滤卡片显示, 不影响池和执行;
   // 执行按每个策略自己声明的 timeframes 路由 (日线走盘后缓存, 分钟走本地分钟K分区)
   const [tfFilter, setTfFilter] = useState<'all' | '1d' | '1m'>('all')
+  // 选股范围: 全市场 / 自选全部 / 自选分组 / 手动输入。
+  // poolSymbols 非空时后端只在该集合内选股, 结果写入独立的作用域缓存。
+  const [scopeSel, setScopeSel] = useState<string>('all')
+  const [manualPool, setManualPool] = useState<string>('')
+  const [poolScope, setPoolScope] = useState<string | null>(null)
   const [activeStrategy, setActiveStrategy] = useState<string | null>(null)
   const [result, setResult] = useState<ScreenerResult | null>(null)
   const [asOf, setAsOf] = useState<string>('')
@@ -210,24 +215,24 @@ export function Screener() {
   const documentVisible = useDocumentVisible()
   const inTradingSession = quoteStatus.data?.is_trading_hours !== false
   const summaryQuery = useQuery({
-    queryKey: pendingRun?.taskId ? [...QK.screenerCachedSummary, pendingRun.taskId] : QK.screenerCachedSummary,
-    queryFn: () => api.screenerCachedSummary(pendingRun?.taskId),
+    queryKey: [...QK.screenerCachedSummary, pendingRun?.taskId ?? '', poolScope ?? ''],
+    queryFn: () => api.screenerCachedSummary(pendingRun?.taskId, poolScope),
     placeholderData: previous => previous,
     enabled: assetType === 'stock',
     refetchInterval: pendingRun ? pollingInterval(2000, false, documentVisible) : false,
   })
 
   const fullCachedQuery = useQuery({
-    queryKey: QK.screenerCached(asOf, extColumnsParam),
-    queryFn: () => api.screenerCached(extColumnsParam || undefined),
+    queryKey: [...QK.screenerCached(asOf, extColumnsParam), poolScope ?? ''],
+    queryFn: () => api.screenerCached(extColumnsParam || undefined, poolScope),
     enabled: assetType === 'stock' && tfFilter !== '1m' && showAll,
     // 交易时段跟随行情轮询; 收盘后价格不再变, 降为 60s 仅兜底数据修正
     refetchInterval: pollingInterval(inTradingSession ? 6_000 : 60_000, false, documentVisible),
   })
 
   const singleCachedQuery = useQuery({
-    queryKey: QK.screenerCachedResult(activeStrategy ?? '', asOf, extColumnsParam),
-    queryFn: () => api.screenerCachedResult(activeStrategy!, extColumnsParam || undefined),
+    queryKey: [...QK.screenerCachedResult(activeStrategy ?? '', asOf, extColumnsParam), poolScope ?? ''],
+    queryFn: () => api.screenerCachedResult(activeStrategy!, extColumnsParam || undefined, poolScope),
     enabled: assetType === 'stock'
       && activeStrategyTimeframe === '1d'
       && !showAll
@@ -379,6 +384,50 @@ export function Screener() {
     )
   }, [loadErrors])
 
+  // 选股范围 → 股票池。自选与分组数据复用自选页的查询缓存。
+  const scopeWatchlistQuery = useQuery({
+    queryKey: QK.watchlist,
+    queryFn: api.watchlistList,
+    staleTime: 30_000,
+    enabled: assetType === 'stock' && scopeSel !== 'all' && scopeSel !== 'manual',
+  })
+  // 分组清单按需加载: 页面首屏不额外请求, 用户悬停/聚焦范围选择器时才拉。
+  const [scopePickerTouched, setScopePickerTouched] = useState(false)
+  const scopeGroupsQuery = useQuery({
+    queryKey: QK.watchlistGroups,
+    queryFn: api.watchlistGroups,
+    staleTime: 60_000,
+    enabled: assetType === 'stock' && (scopePickerTouched || scopeSel.startsWith('group:')),
+  })
+  const poolSymbols = useMemo<string[] | undefined>(() => {
+    if (assetType !== 'stock' || scopeSel === 'all') return undefined
+    if (scopeSel === 'manual') {
+      const out: string[] = []
+      for (const raw of manualPool.split(/[\s,，;；]+/)) {
+        const value = raw.trim().toUpperCase()
+        if (!value) continue
+        const symbol = /^\d{6}$/.test(value)
+          ? value + (value.startsWith('6')
+            ? '.SH'
+            : value.startsWith('4') || value.startsWith('8') ? '.BJ' : '.SZ')
+          : value
+        if (!out.includes(symbol)) out.push(symbol)
+      }
+      return out.length ? out : undefined
+    }
+    const entries = scopeWatchlistQuery.data?.symbols ?? []
+    if (scopeSel === 'watchlist') return entries.map(e => e.symbol)
+    const groupId = scopeSel.startsWith('group:') ? scopeSel.slice(6) : ''
+    if (!groupId) return undefined
+    return entries.filter(e => (e.group_ids ?? []).includes(groupId)).map(e => e.symbol)
+  }, [assetType, scopeSel, manualPool, scopeWatchlistQuery.data])
+  // 空数组 (空分组) 与未限定 (全市场) 必须可区分
+  const poolKey = poolSymbols === undefined ? '@all' : poolSymbols.join(',')
+  const scopeReady = assetType !== 'stock'
+    || scopeSel === 'all'
+    || scopeSel === 'manual'
+    || scopeWatchlistQuery.isSuccess
+
   // 进入页面自动跑策略池中的策略，获取命中数 (日线走盘后缓存/渐进式 runAll;
   // 分钟策略结果不落缓存, 由 runAllMinute 异步批量计算后合入 hitCounts)
   const runAll = useMutation({
@@ -389,9 +438,11 @@ export function Screener() {
         assetType,
         '1d',
         ensure,
+        poolSymbols,
       ),
     onSuccess: (data) => {
       if (data.as_of) setAsOf(data.as_of)
+      setPoolScope(data.scope ?? null)
       const counts: Record<string, number> = {}
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
@@ -462,6 +513,23 @@ export function Screener() {
       },
     })
   }, [runAll])
+
+  // 选股范围变化 → 清空旧命中数并立即重跑。池化结果写入独立作用域缓存,
+  // 与全市场缓存互不覆盖; 切回全市场时 scope 归零, 重新读全市场缓存。
+  const prevPoolKeyRef = useRef(poolKey)
+  useEffect(() => {
+    if (prevPoolKeyRef.current === poolKey) return
+    prevPoolKeyRef.current = poolKey
+    if (!scopeReady) return
+    setPoolScope(null)
+    setHitCounts({})
+    setExpiredCounts({})
+    setPendingRun(null)
+    setActiveStrategy(null)
+    setResult(null)
+    setShowAll(false)
+    requestRunAll({ ensure: true })
+  }, [poolKey, scopeReady, requestRunAll])
 
   // 摘要只同步当前日期的卡片数量，避免旧日期缓存短暂显示成当前结果。
   useEffect(() => {
@@ -995,6 +1063,38 @@ export function Screener() {
                 </button>
               ))}
             </div>
+            {/* 选股范围: 全市场 / 自选全部 / 自选分组 / 手动输入。
+                池化结果写入独立作用域缓存, 不会覆盖全市场结果。 */}
+            <select
+              value={scopeSel}
+              onChange={e => setScopeSel(e.target.value)}
+              onPointerEnter={() => setScopePickerTouched(true)}
+              onFocus={() => setScopePickerTouched(true)}
+              disabled={assetType !== 'stock'}
+              title="限定选股范围; 结果按范围隔离缓存"
+              className="h-7 px-2 rounded-btn border border-border bg-surface text-xs text-secondary
+                hover:border-accent/40 focus:outline-none focus:border-accent/60
+                disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            >
+              <option value="all">全市场</option>
+              <option value="watchlist">自选全部</option>
+              {(scopeGroupsQuery.data?.groups ?? []).map(g => (
+                <option key={g.id} value={`group:${g.id}`}>自选 · {g.name}</option>
+              ))}
+              <option value="manual">手动输入…</option>
+            </select>
+            {scopeSel === 'manual' && (
+              <input
+                value={manualPool}
+                onChange={e => setManualPool(e.target.value)}
+                placeholder="600519.SH, 000001.SZ"
+                className="h-7 w-44 px-2 rounded-btn border border-border bg-surface text-xs
+                  text-secondary placeholder:text-muted focus:outline-none focus:border-accent/60"
+              />
+            )}
+            {poolSymbols !== undefined && (
+              <span className="text-[10px] text-muted tabular-nums">{poolSymbols.length} 只</span>
+            )}
             {/* 重新运行策略：重载策略文件并重跑全部策略，更新命中个股 */}
             <button
               onClick={() => reloadStrategies.mutate()}

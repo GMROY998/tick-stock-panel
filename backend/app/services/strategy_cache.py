@@ -163,6 +163,79 @@ def write_cache(
         _write_cache_locked(path, data_dir, as_of, results, strict=strict)
 
 
+# 股票池作用域缓存: 与全市场 strategy_cache.json 物理隔离, 池化运行永不覆盖
+# 全市场结果 (否则切回全市场会看到自选股的命中数)。结构:
+#   {"pool:<hash>": {"as_of": "...", "results": {sid: {...}}, "updated_at": ms}}
+_SCOPED_FILENAME = "strategy_cache_scoped.json"
+_MAX_SCOPES = 12
+
+
+def _scoped_path(data_dir: Path) -> Path:
+    return data_dir / "user_data" / _SCOPED_FILENAME
+
+
+def read_scoped(data_dir: Path, scope: str) -> dict | None:
+    """读取指定股票池作用域的结果快照; 不存在返回 None。"""
+    path = _scoped_path(data_dir)
+    with _file_lock:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取池化策略缓存失败: %s", exc)
+            return None
+    bucket = payload.get(scope) if isinstance(payload, dict) else None
+    return bucket if isinstance(bucket, dict) else None
+
+
+def write_scoped(
+    data_dir: Path,
+    scope: str,
+    as_of: str,
+    results: dict[str, Any],
+    *,
+    validate: Callable[[], None] | None = None,
+) -> None:
+    """写入股票池作用域结果 (独立文件, 原子替换)。"""
+    path = _scoped_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _file_lock:
+        if validate is not None:
+            validate()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 -- 缺失/损坏都按空处理, 不阻塞本次结果
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        old = payload.get(scope) or {}
+        merged = (
+            {**(old.get("results") or {}), **results}
+            if old.get("as_of") == as_of
+            else results
+        )
+        payload[scope] = {
+            "as_of": as_of,
+            "results": merged,
+            "updated_at": int(time.time() * 1000),
+        }
+        if len(payload) > _MAX_SCOPES:
+            keep = sorted(
+                payload, key=lambda k: (payload[k] or {}).get("updated_at") or 0
+            )[-_MAX_SCOPES:]
+            payload = {k: payload[k] for k in keep}
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, default=_json_default),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        logger.info(
+            "池化策略缓存已写入: scope=%s as_of=%s %d 策略", scope, as_of, len(merged)
+        )
+
+
 def _write_cache_locked(
     path: Path,
     data_dir: Path,

@@ -138,7 +138,7 @@ it('clears a failed minute run when opening a counted daily card, without recalc
 
   await clickCard('日线策略')
 
-  expect(api.screenerCachedResult).toHaveBeenCalledWith('daily', undefined)
+  expect(api.screenerCachedResult).toHaveBeenCalledWith('daily', undefined, null)
   expect(host.textContent).toContain('000001.SZ')
   expect(host.textContent).not.toContain(errorMessage)
   expect(api.screenerRunPreset).toHaveBeenCalledTimes(1)
