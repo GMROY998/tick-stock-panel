@@ -211,6 +211,23 @@ def _window_any(matrix: np.ndarray, min_gap: int, max_gap: int) -> np.ndarray:
     return recent
 
 
+def chain_entry_matrices(
+    entries: list[np.ndarray],
+    min_gaps: list[int] | tuple[int, ...],
+    max_gaps: list[int] | tuple[int, ...],
+) -> np.ndarray:
+    """把多段 entry 矩阵按窗口链式合并为最终 entry。"""
+    if not entries:
+        return np.zeros((0, 0), dtype=bool)
+    valid = np.asarray(entries[0], dtype=bool)
+    for index in range(1, len(entries)):
+        recent = _window_any(
+            valid, int(min_gaps[index - 1]), int(max_gaps[index - 1])
+        )
+        valid = np.asarray(entries[index], dtype=bool) & recent
+    return valid
+
+
 def merge_signal_matrices(
     shape: tuple[int, int],
     sigs: list,
@@ -228,14 +245,14 @@ def merge_signal_matrices(
     from app.strategy.composite import _hold_masks_from_entries
 
     n_stages = len(sigs)
-    n_times, _ = shape
     if n_stages < 2 or len(min_gaps) != n_stages - 1 or len(max_gaps) != n_stages - 1:
         return make_signal_matrix(shape)
 
-    valid = np.asarray(sigs[0].entry, dtype=bool)
-    for k in range(1, n_stages):
-        recent = _window_any(valid, int(min_gaps[k - 1]), int(max_gaps[k - 1]))
-        valid = np.asarray(sigs[k].entry, dtype=bool) & recent
+    valid = chain_entry_matrices(
+        [np.asarray(sig.entry, dtype=bool) for sig in sigs],
+        min_gaps,
+        max_gaps,
+    )
 
     last = sigs[-1]
     hold_mask = _hold_masks_from_entries([valid], max_hold)[0]

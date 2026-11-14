@@ -126,11 +126,13 @@ class ResolvedFeaturePlan:
 
 def _merge_resolved_feature_plans(
     plans: list[ResolvedFeaturePlan],
+    *,
+    allow_mixed_backends: bool = False,
 ) -> ResolvedFeaturePlan:
     if not plans:
         raise ValueError("cannot merge an empty feature plan list")
     backends = {plan.execution_backend for plan in plans}
-    if len(backends) != 1:
+    if len(backends) != 1 and not allow_mixed_backends:
         raise ValueError("shared preparation requires a single execution backend")
 
     def _union(field: str) -> frozenset[str]:
@@ -148,7 +150,9 @@ def _merge_resolved_feature_plans(
         instrument_columns=_union("instrument_columns"),
         warmup_bars=max(plan.warmup_bars for plan in plans),
         full_feature_fallback=any(plan.full_feature_fallback for plan in plans),
-        execution_backend=backends.pop(),
+        # 混合后端 (polars_expr + python_history_legacy) 时取首个;
+        # 两者同属面板路径, _panel_backend 判定一致。
+        execution_backend=plans[0].execution_backend,
         fundamental_columns=_union("fundamental_columns"),
     )
 
@@ -1042,6 +1046,51 @@ class StrategyBacktestService:
         self._sequential_child_order = list(child_ids)
         return _merge_resolved_feature_plans(plans), resolved_children
 
+    def _resolve_sequential_panel_plan(
+        self,
+        strategy: StrategyDef,
+        *,
+        params: dict,
+        basic_filter: dict,
+        overrides: dict,
+        asset_type: str = "stock",
+    ) -> ResolvedFeaturePlan:
+        """顺序策略(面板路径)的特征计划: 各段计划并集。
+
+        用于子策略包含 polars_expr / python_history_legacy 的场景 —
+        这类策略没有 MATRIX_STRATEGY, 只能走面板逐行求值。
+        """
+        assert strategy.sequential is not None
+        resolver = StrategyDependencyResolver()
+        plans: list[ResolvedFeaturePlan] = []
+        loader = getattr(self.strategy_engine, "_override_loader", None)
+        for cid in strategy.sequential.stages:
+            stage_def = self.strategy_engine.get(cid)
+            stage_override: dict = {}
+            if loader is not None:
+                try:
+                    loaded = loader(cid)
+                    if isinstance(loaded, dict):
+                        stage_override = dict(loaded)
+                except Exception:  # noqa: BLE001
+                    pass
+            stage_params = self.strategy_engine.resolve_params(
+                stage_def, overrides=stage_override
+            )
+            plans.append(
+                resolver.resolve(
+                    stage_def,
+                    params=stage_params,
+                    basic_filter=basic_filter,
+                    entry_signals=list(stage_def.entry_signals),
+                    exit_signals=list(stage_def.exit_signals),
+                    overrides=stage_override,
+                    asset_type=asset_type,
+                )
+            )
+        # 顺序策略各段可能混用 polars_expr 与 python_history_legacy, 允许混合
+        return _merge_resolved_feature_plans(plans, allow_mixed_backends=True)
+
     def _generate_composite_signal_matrix(
         self,
         resolved_children: list[tuple[StrategyDef, dict, dict]],
@@ -1563,14 +1612,30 @@ class StrategyBacktestService:
                     asset_type=config.asset_type,
                 )
             elif s.execution_backend == "sequential":
-                # sequential 回测: 前置 + 触发两个矩阵子策略, 计划取并集。
-                feature_plan, composite_children_resolved = self._resolve_sequential_feature_plan(
-                    s,
-                    params=params,
-                    basic_filter=basic_filter,
-                    overrides=overrides,
-                    asset_type=config.asset_type,
-                )
+                # 全部段都是矩阵策略 → 走矩阵路径(向量化);
+                # 含 polars_expr / 历史形态策略 → 走面板路径。
+                stage_defs = [
+                    self.strategy_engine.get(cid) for cid in s.sequential.stages
+                ] if s.sequential is not None else []
+                if stage_defs and all(
+                    item.execution_backend == "matrix_native" for item in stage_defs
+                ):
+                    feature_plan, composite_children_resolved = self._resolve_sequential_feature_plan(
+                        s,
+                        params=params,
+                        basic_filter=basic_filter,
+                        overrides=overrides,
+                        asset_type=config.asset_type,
+                    )
+                else:
+                    composite_children_resolved = None
+                    feature_plan = self._resolve_sequential_panel_plan(
+                        s,
+                        params=params,
+                        basic_filter=basic_filter,
+                        overrides=overrides,
+                        asset_type=config.asset_type,
+                    )
             else:
                 composite_children_resolved = None
                 feature_plan = StrategyDependencyResolver().resolve(
@@ -1760,8 +1825,11 @@ class StrategyBacktestService:
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
 
-        if s.execution_backend in ("composite", "sequential"):
-            # composite / sequential 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
+        if (
+            s.execution_backend in ("composite", "sequential")
+            and composite_children_resolved is not None
+        ):
+            # composite / 全矩阵 sequential 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
             # 退出采用来源投影(composite.merge_signal_matrices), 不串平其他子策略仓位。
             if composite_children_resolved is None:
                 return _err("叠加策略子策略解析失败")
@@ -2039,13 +2107,19 @@ class StrategyBacktestService:
             if panel is None or formal_range is None:
                 return _err("非矩阵策略不能使用共享基础矩阵")
             try:
-                panel, candidate_mask, entry_mask, raw_exit_mask = self._evaluate_panel_decisions(
-                    panel, s, params, overrides, basic_filter, entry_signals, exit_signals,
-                    factor_snapshot=factor_snapshot,
-                )
+                if s.execution_backend == "sequential":
+                    panel, candidate_mask, entry_mask, raw_exit_mask = self._evaluate_sequential_panel(
+                        panel, s, params, overrides, basic_filter,
+                        factor_snapshot=factor_snapshot,
+                    )
+                else:
+                    panel, candidate_mask, entry_mask, raw_exit_mask = self._evaluate_panel_decisions(
+                        panel, s, params, overrides, basic_filter, entry_signals, exit_signals,
+                        factor_snapshot=factor_snapshot,
+                    )
             except ValueError as exc:
                 return _err(str(exc))
-            if evidence is not None:
+            if evidence is not None and s.execution_backend != "sequential":
                 evidence.check_panel(
                     self._decision_frame(panel, candidate_mask, entry_mask, raw_exit_mask),
                     lambda data: self._decision_frame(*self._evaluate_panel_decisions(
@@ -2808,6 +2882,82 @@ class StrategyBacktestService:
             entry = entry & mask
         exits = self._build_signal_mask(panel, exit_signals, "_exit")
         return panel, candidate, entry, exits
+
+    def _evaluate_sequential_panel(
+        self, panel, strategy, params, overrides, basic_filter, *, factor_snapshot=None,
+    ):
+        """面板路径的顺序策略: 逐段求 entry, 再按 [min,max] 窗口链式合并。
+
+        适用于子策略含 polars_expr / python_history_legacy 的场景。
+        返回 (最后一段的已评分 panel, 最后一段候选掩码, 链式 entry 掩码, 最后一段 exit)。
+        """
+        from app.strategy import sequential as seq_mod
+
+        assert strategy.sequential is not None
+        spec = strategy.sequential
+        stages = list(spec.stages)
+        min_gaps = list(spec.min_gaps)
+        max_gaps = list(spec.max_gaps)
+
+        loader = getattr(self.strategy_engine, "_override_loader", None)
+        entries: list[np.ndarray] = []
+        last_panel = last_candidate = last_exit = None
+        for index, cid in enumerate(stages):
+            stage_def = self.strategy_engine.get(cid)
+            stage_override: dict = {}
+            if loader is not None:
+                try:
+                    loaded = loader(cid)
+                    if isinstance(loaded, dict):
+                        stage_override = dict(loaded)
+                except Exception:  # noqa: BLE001
+                    pass
+            stage_params = self.strategy_engine.resolve_params(
+                stage_def, overrides=stage_override
+            )
+            stage_panel, candidate, entry, exit_mask = self._evaluate_panel_decisions(
+                panel,
+                stage_def,
+                stage_params,
+                stage_override,
+                basic_filter,
+                list(stage_def.entry_signals),
+                list(stage_def.exit_signals),
+                factor_snapshot=factor_snapshot,
+            )
+            entries.append(entry.fill_null(False).to_numpy())
+            if index == len(stages) - 1:
+                last_panel, last_candidate, last_exit = stage_panel, candidate, exit_mask
+
+        # panel 行 → (交易日, 标的) 矩阵, 便于跨日窗口运算
+        dates_col = [str(value)[:10] for value in panel.get_column("date").to_list()]
+        symbols_col = [str(value) for value in panel.get_column("symbol").to_list()]
+        unique_dates = sorted(set(dates_col))
+        unique_symbols = sorted(set(symbols_col))
+        date_pos = {value: i for i, value in enumerate(unique_dates)}
+        symbol_pos = {value: i for i, value in enumerate(unique_symbols)}
+        date_index = np.fromiter(
+            (date_pos[value] for value in dates_col), dtype=np.int64, count=len(dates_col)
+        )
+        symbol_index = np.fromiter(
+            (symbol_pos[value] for value in symbols_col),
+            dtype=np.int64,
+            count=len(symbols_col),
+        )
+
+        shape = (len(unique_dates), len(unique_symbols))
+        matrices: list[np.ndarray] = []
+        for stage_entry in entries:
+            matrix = np.zeros(shape, dtype=bool)
+            matrix[date_index, symbol_index] = stage_entry
+            matrices.append(matrix)
+
+        chained = seq_mod.chain_entry_matrices(matrices, min_gaps, max_gaps)
+        final = chained[date_index, symbol_index]
+        entry_mask = pl.Series("_entry", final, dtype=pl.Boolean)
+
+        assert last_panel is not None and last_candidate is not None and last_exit is not None
+        return last_panel, last_candidate, entry_mask, last_exit
 
     @staticmethod
     def _decision_frame(panel, candidate, entry, exits):
