@@ -117,6 +117,21 @@ export function StrategyCard({
     : 'bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent'
   const srcLabel = cardSize === 'mini' ? (SRC_MAP[source ?? ''] ?? '自') : (SRC_MAP[source ?? ''] ?? '自定义')
   const badgeCls = BADGE_CLS_MAP[source ?? 'custom'] ?? BADGE_CLS_MAP.custom
+  const diagTitle = diagnostics?.kind === 'sequential'
+    ? [
+        diagnostics.stage_hits?.length
+          ? `各段命中 ${diagnostics.stage_hits.join(' / ')}`
+          : '',
+        `窗口 ${diagnostics.window[0] ?? ''} ~ ${diagnostics.window[1] ?? ''}`,
+        diagnostics.max_gaps?.length
+          ? `间隔 ${diagnostics.min_gaps
+              ?.map((lo, i) => `${lo}~${diagnostics.max_gaps?.[i] ?? ''}`)
+              .join('，')}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('；')
+    : undefined
 
   // 失效数 > 0 时显示
   const hasExpired = expiredCount != null && expiredCount > 0
@@ -159,7 +174,7 @@ export function StrategyCard({
             {diagnostics?.kind === 'sequential' && (
               <span
                 className="mt-0.5 text-[9px] text-muted/80 tabular-nums leading-tight"
-                title={`窗口 ${diagnostics.window[0] ?? ''} ~ ${diagnostics.window[1] ?? ''}, 最大间隔 ${diagnostics.max_gap_days} 个交易日`}
+                title={diagTitle}
               >
                 前置 {diagnostics.pre_hits} · 触发 {diagnostics.trigger_hits} · 交集 {diagnostics.match}
               </span>
@@ -204,7 +219,7 @@ export function StrategyCard({
               {diagnostics?.kind === 'sequential' && (
                 <span
                   className="text-[9px] text-muted/70 tabular-nums shrink-0"
-                  title={`窗口 ${diagnostics.window[0] ?? ''} ~ ${diagnostics.window[1] ?? ''}, 最大间隔 ${diagnostics.max_gap_days} 个交易日`}
+                  title={diagTitle}
                 >
                   前置{diagnostics.pre_hits}·触发{diagnostics.trigger_hits}·交集{diagnostics.match}
                 </span>

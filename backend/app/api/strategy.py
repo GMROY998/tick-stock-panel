@@ -247,11 +247,17 @@ def _strategy_detail(
         # 顺序策略: 前置/触发子策略与最大间隔(供前端展示与回填)。
         "sequential": (
             {
-                "pre": s.sequential.pre_strategy_id,
-                "trigger": s.sequential.trigger_strategy_id,
-                "max_gap_days": s.sequential.max_gap_days,
-                "pre_meta": _child_meta(engine, s.sequential.pre_strategy_id),
-                "trigger_meta": _child_meta(engine, s.sequential.trigger_strategy_id),
+                "pre": s.sequential.stages[0],
+                "trigger": s.sequential.stages[-1],
+                "max_gap_days": s.sequential.max_gaps[-1],
+                "stages": list(s.sequential.stages),
+                "min_gaps": list(s.sequential.min_gaps),
+                "max_gaps": list(s.sequential.max_gaps),
+                "stage_meta": [
+                    _child_meta(engine, cid) for cid in s.sequential.stages
+                ],
+                "pre_meta": _child_meta(engine, s.sequential.stages[0]),
+                "trigger_meta": _child_meta(engine, s.sequential.stages[-1]),
             }
             if s.execution_backend == "sequential" and s.sequential is not None
             else None
@@ -338,8 +344,13 @@ class StrategySequentialSaveRequest(BaseModel):
     strategy_id: str
     name: str = ""
     description: str = ""
-    pre_strategy_id: str
-    trigger_strategy_id: str
+    # 新格式: 2~4 段, 相邻段各自一组 [min_gap, max_gap]
+    stages: list[str] | None = None
+    min_gaps: list[int] | None = None
+    max_gaps: list[int] | None = None
+    # 兼容旧两段调用
+    pre_strategy_id: str | None = None
+    trigger_strategy_id: str | None = None
     max_gap_days: int = 3
     mode: Literal["create", "update"] = "create"
 
@@ -1368,11 +1379,16 @@ def _render_sequential_code(
     sid: str,
     name: str,
     description: str,
-    pre_strategy_id: str,
-    trigger_strategy_id: str,
-    max_gap_days: int,
+    stages: list[str],
+    min_gaps: list[int],
+    max_gaps: list[int],
 ) -> str:
     """渲染声明式 sequential 策略 .py 文件内容 (无业务代码)。"""
+    import json as _json
+
+    stages_json = ",\n            ".join(
+        _json.dumps(item, ensure_ascii=False) for item in stages
+    )
     safe_name = name or sid
     return f'''"""顺序策略 {sid}（自动生成, 请勿手改业务逻辑）。"""
 META = {{
@@ -1381,18 +1397,17 @@ META = {{
     "description": {description!r},
     "asset_types": ["stock"],
     "timeframes": ["1d"],
-    "params": [
-        {{"id": "max_gap_days", "label": "最大间隔(交易日)", "type": "int",
-          "default": {int(max_gap_days)!r}, "min": 0, "max": 60}},
-    ],
+    "params": [],
     "scoring": {{}},
     "order_by": "score",
     "descending": True,
     "limit": 100,
     "sequential": {{
-        "pre": {pre_strategy_id!r},
-        "trigger": {trigger_strategy_id!r},
-        "max_gap_days": {int(max_gap_days)!r},
+        "stages": [
+            {stages_json}
+        ],
+        "min_gaps": {list(min_gaps)!r},
+        "max_gaps": {list(max_gaps)!r},
     }},
 }}
 EXECUTION_BACKEND = "sequential"
@@ -1404,10 +1419,33 @@ def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Reque
     sid = _validate_strategy_id(req.strategy_id)
     if not sid.startswith("sequential_"):
         raise ValueError("顺序策略 ID 必须以 sequential_ 开头")
-    if req.pre_strategy_id == req.trigger_strategy_id:
-        raise ValueError("前置策略与触发策略不能相同")
-    if req.max_gap_days < 0 or req.max_gap_days > 60:
-        raise ValueError("max_gap_days 必须在 [0, 60] 之间")
+    # 构造段序列与相邻段窗口 (兼容旧两段调用)
+    if req.stages:
+        stages = [str(item).strip() for item in req.stages if str(item or "").strip()]
+        min_gaps = [int(item) for item in (req.min_gaps or [])]
+        max_gaps = [int(item) for item in (req.max_gaps or [])]
+        if not min_gaps:
+            min_gaps = [0] * (len(stages) - 1)
+        if not max_gaps:
+            max_gaps = [3] * (len(stages) - 1)
+    else:
+        if not req.pre_strategy_id or not req.trigger_strategy_id:
+            raise ValueError("请提供 stages 或 pre_strategy_id/trigger_strategy_id")
+        stages = [req.pre_strategy_id, req.trigger_strategy_id]
+        min_gaps = [0]
+        max_gaps = [int(req.max_gap_days)]
+
+    if not (2 <= len(stages) <= 4):
+        raise ValueError("顺序策略段数必须在 2~4 之间")
+    if len(set(stages)) != len(stages):
+        raise ValueError("顺序策略的段不能重复选择同一个策略")
+    if len(min_gaps) != len(stages) - 1 or len(max_gaps) != len(stages) - 1:
+        raise ValueError("最小/最大间隔数量必须等于段数-1")
+    for index, (lo, hi) in enumerate(zip(min_gaps, max_gaps)):
+        if lo < 0 or hi < 0 or lo > hi or hi > 60:
+            raise ValueError(
+                f"第{index + 1}段间隔非法: 需满足 0 <= 最小 <= 最大 <= 60"
+            )
 
     engine = _get_engine(request)
     data_dir = _data_dir(request)
@@ -1427,10 +1465,8 @@ def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Reque
         if existing.execution_backend != "sequential":
             raise ValueError("目标策略不是顺序策略，无法以顺序模式覆盖")
 
-    for cid, role in (
-        (req.pre_strategy_id, "前置"),
-        (req.trigger_strategy_id, "触发"),
-    ):
+    for index, cid in enumerate(stages):
+        role = f"第{index + 1}段"
         try:
             child_def = _get_public_strategy(engine, cid)
         except HTTPException as exc:
@@ -1444,9 +1480,9 @@ def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Reque
         sid,
         req.name,
         req.description,
-        req.pre_strategy_id,
-        req.trigger_strategy_id,
-        req.max_gap_days,
+        stages,
+        min_gaps,
+        max_gaps,
     )
 
     # 与叠加策略共用 composite 目录 (两者都是声明式包装策略)
@@ -1465,6 +1501,8 @@ def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Reque
             raise ValueError(f"策略后端异常: 期望 sequential, 实际 {loaded.execution_backend}")
         if loaded.sequential is None:
             raise ValueError("策略缺少 sequential 声明")
+        if list(loaded.sequential.stages) != stages:
+            raise ValueError("策略段序列与提交内容不一致")
     except Exception as e:
         _restore_strategy_file(path, previous_code)
         engine.reload()

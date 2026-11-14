@@ -456,11 +456,16 @@ export interface SequentialDiagnostics {
   pre: string
   trigger: string
   max_gap_days: number
+  stages?: string[]
+  min_gaps?: number[]
+  max_gaps?: number[]
+  /** 各段在窗口内的去重命中数 */
+  stage_hits?: number[]
   window: string[]
   pre_hits: number
   trigger_hits: number
   match: number
-  days: { date: string; pre: number; trigger: number; matched: number }[]
+  days: { date: string; pre: number; trigger: number; matched: number; stages?: number[] }[]
 }
 
 export interface ScreenerResultSummary {
@@ -954,11 +959,15 @@ export interface StrategyDetail {
   limit: number
   // 叠加策略(composite)专属: 子策略列表与合并模式。非 composite 时为 null。
   composite_children?: CompositeChildInfo[] | null
-  /** 顺序策略: 前置/触发子策略与最大间隔 */
+  /** 顺序策略: 2~4 段以及相邻段的最小/最大间隔 */
   sequential?: {
     pre: string
     trigger: string
     max_gap_days: number
+    stages: string[]
+    min_gaps: number[]
+    max_gaps: number[]
+    stage_meta?: ({ id: string; name: string } | null)[]
     pre_meta?: { id: string; name: string } | null
     trigger_meta?: { id: string; name: string } | null
   } | null
@@ -5248,14 +5257,14 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  /** 保存顺序策略 (前置 A → 触发 B, 最大间隔 N 个交易日) */
+  /** 保存顺序策略 (2~4 段, 每段一组 [min_gap, max_gap]) */
   strategySaveSequential: (payload: {
     strategy_id: string
     name: string
     description?: string
-    pre_strategy_id: string
-    trigger_strategy_id: string
-    max_gap_days: number
+    stages: string[]
+    min_gaps: number[]
+    max_gaps: number[]
     mode?: 'create' | 'update'
   }) =>
     request<StrategyCodeSaveResult>('/api/strategies/sequential/save', {

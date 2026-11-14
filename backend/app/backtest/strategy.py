@@ -984,7 +984,7 @@ class StrategyBacktestService:
         """
         assert strategy.sequential is not None
         spec = strategy.sequential
-        child_ids = [spec.pre_strategy_id, spec.trigger_strategy_id]
+        child_ids = list(spec.stages)
 
         resolver = StrategyDependencyResolver()
         plans: list[ResolvedFeaturePlan] = []
@@ -1091,14 +1091,16 @@ class StrategyBacktestService:
         self,
         resolved_children: list[tuple[StrategyDef, dict, dict]],
         market_data: MarketDataMatrix,
-        max_gap_days: int,
+        min_gaps: list[int],
+        max_gaps: list[int],
         max_hold: int,
         timing_ms: dict[str, float],
     ):
-        """顺序回测信号: 逐子策略算 SignalMatrix, 再用状态机合并。
+        """顺序回测信号: 逐子策略算 SignalMatrix, 再按链式窗口合并。
 
         合并语义见 app.strategy.sequential.merge_signal_matrices:
-        entry = trigger & (pre 在最近 N 个交易日内命中过), exit 来源投影到 trigger。
+        entry[k] = stage_k & (stage_{k-1} 在 [min_gap, max_gap] 内命中过),
+        exit 来源投影到最后一段。
         """
         from app.strategy import sequential as sequential_mod
 
@@ -1121,7 +1123,8 @@ class StrategyBacktestService:
         return sequential_mod.merge_signal_matrices(
             market_data.shape,
             sigs,
-            max_gap_days,
+            min_gaps,
+            max_gaps,
             max_hold,
         )
 
@@ -1809,18 +1812,18 @@ class StrategyBacktestService:
             strategy_max_hold = max(int(max_hold_days or 0), 1) if max_hold_days else 250
             merge_mode = str(params.get("merge_mode") or "union")
             min_confirm = int(params.get("min_confirm") or 0)
-            seq_max_gap = 0
-            if s.execution_backend == "sequential":
-                seq_spec = s.sequential
-                seq_max_gap = int(
-                    params.get("max_gap_days", seq_spec.max_gap_days if seq_spec else 3)
-                )
+            seq_min_gaps: list[int] = []
+            seq_max_gaps: list[int] = []
+            if s.execution_backend == "sequential" and s.sequential is not None:
+                seq_min_gaps = list(s.sequential.min_gaps)
+                seq_max_gaps = list(s.sequential.max_gaps)
             try:
                 if s.execution_backend == "sequential":
                     signal_matrix = self._generate_sequential_signal_matrix(
                         composite_children_resolved,
                         market_data,
-                        seq_max_gap,
+                        seq_min_gaps,
+                        seq_max_gaps,
                         strategy_max_hold,
                         timing_ms,
                     )
@@ -1841,8 +1844,8 @@ class StrategyBacktestService:
                     evidence.check_matrix(
                         market_data, signal_matrix,
                         lambda data: self._generate_sequential_signal_matrix(
-                            composite_children_resolved, data, seq_max_gap,
-                            strategy_max_hold, {},
+                            composite_children_resolved, data, seq_min_gaps,
+                            seq_max_gaps, strategy_max_hold, {},
                         ),
                     )
                 else:
@@ -2235,11 +2238,9 @@ class StrategyBacktestService:
                 if s.execution_backend == "composite"
                 else {
                     "sequential": {
-                        "pre": s.sequential.pre_strategy_id,
-                        "trigger": s.sequential.trigger_strategy_id,
-                        "max_gap_days": int(
-                            params.get("max_gap_days", s.sequential.max_gap_days)
-                        ),
+                        "stages": list(s.sequential.stages),
+                        "min_gaps": list(s.sequential.min_gaps),
+                        "max_gaps": list(s.sequential.max_gaps),
                     }
                 }
                 if s.execution_backend == "sequential" and s.sequential is not None

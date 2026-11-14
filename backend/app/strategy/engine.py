@@ -453,10 +453,8 @@ class StrategyEngine:
         spec = strategy.sequential
         parent_assets = list(strategy.meta.get("asset_types", ["stock"]))
         parent_timeframes = list(strategy.meta.get("timeframes", ["1d"]))
-        for role, child_id in (
-            ("前置", spec.pre_strategy_id),
-            ("触发", spec.trigger_strategy_id),
-        ):
+        for index, child_id in enumerate(spec.stages):
+            role = f"第{index + 1}段"
             child_def = candidates.get(child_id)
             if child_def is None:
                 return f"sequential strategy {sid} 引用的{role}策略 {child_id!r} 不存在"
@@ -895,22 +893,26 @@ class StrategyEngine:
                     self.required_history_bars(child_ids, params_map=params_map),
                 )
             elif strategy.execution_backend == "sequential":
-                # 顺序策略 = 子策略预热 + 最大等待窗口 (A 可能命中在 N 个交易日之前)。
+                # 顺序策略 = 子策略预热 + 所有相邻段最大间隔之和。
                 if strategy.sequential is None:
                     continue
                 spec = strategy.sequential
-                gap = spec.max_gap_days
-                override_params = (overrides_map.get(strategy_id) or {}).get("params") or {}
-                try:
-                    gap = int(override_params.get("max_gap_days", gap))
-                except (TypeError, ValueError):
-                    gap = spec.max_gap_days
+                max_gaps = list(spec.max_gaps)
+                # 兼容旧两段策略: params.max_gap_days 可覆盖唯一的一段间隔
+                if len(max_gaps) == 1:
+                    override_params = (overrides_map.get(strategy_id) or {}).get("params") or {}
+                    try:
+                        max_gaps[0] = int(
+                            override_params.get("max_gap_days", max_gaps[0])
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 child_required = self.required_history_bars(
-                    [spec.pre_strategy_id, spec.trigger_strategy_id],
+                    list(spec.stages),
                     params_map=params_map,
                     overrides_map=overrides_map,
                 )
-                required = max(required, child_required + max(0, gap))
+                required = max(required, child_required + max(0, sum(max_gaps)))
             elif strategy.filter_history_fn:
                 # lookback_days 优先取自解析后的参数(默认值/保存覆盖/本次调用),
                 # 静态 LOOKBACK_DAYS 兜底。策略可能只把窗口声明为参数
@@ -1892,12 +1894,12 @@ class StrategyEngine:
         overrides: dict | None = None,
         started_at: float,
     ) -> StrategyResult:
-        """顺序策略: 前置 A 命中后 N 个交易日内触发 B 命中才入选。
+        """顺序策略: 2~4 段链式命中, 相邻段各自有 [最小间隔, 最大间隔]。
 
-        做法: 在历史窗口内逐交易日重放 A/B 的命中集合, 再用状态机判定触发日。
+        做法: 在历史窗口内逐交易日重放各段命中集合, 再用链式状态机推进。
         - 只使用 as_of 及之前的数据, 无未来函数;
-        - A/B 之间出现卖点不作废 (按产品约定);
-        - 输出日 = 触发日 (B 命中日), 评分取 B 当日评分, 附带 gap_days。
+        - 中间段出现卖点不作废 (按产品约定);
+        - 输出日 = 最后一段命中日, 评分取最后一段, 附带每段 gap 与总 gap。
         """
         from app.strategy import sequential as seq_mod
 
@@ -1905,10 +1907,17 @@ class StrategyEngine:
         params = params or {}
         overrides = overrides or {}
         spec = strategy.sequential
-        max_gap = int(params.get("max_gap_days", spec.max_gap_days))
-        max_gap = max(0, min(max_gap, seq_mod.MAX_GAP_DAYS))
-        pre_id = spec.pre_strategy_id
-        trig_id = spec.trigger_strategy_id
+        stages = list(spec.stages)
+        min_gaps = list(spec.min_gaps)
+        max_gaps = list(spec.max_gaps)
+        # 兼容旧两段策略: params.max_gap_days 覆盖唯一的一段最大间隔
+        if len(max_gaps) == 1:
+            try:
+                max_gaps[0] = int(params.get("max_gap_days", max_gaps[0]))
+            except (TypeError, ValueError):
+                pass
+        max_gaps = [max(0, min(int(item), seq_mod.MAX_GAP_DAYS)) for item in max_gaps]
+        n_stages = len(stages)
 
         history = context.history
         if history is None or history.is_empty():
@@ -1944,12 +1953,14 @@ class StrategyEngine:
                 elapsed_ms=(time.perf_counter() - started_at) * 1000,
             )
         end_idx = all_dates.index(as_of_str)
-        window = all_dates[max(0, end_idx - max_gap): end_idx + 1]
+        # 链式窗口 = 所有相邻段最大间隔之和 (链可能跨越多段)
+        span = sum(max_gaps)
+        window = all_dates[max(0, end_idx - span): end_idx + 1]
 
         # 子策略覆盖: 与 composite 同口径, 加载各自保存配置 + 统一 basic_filter。
         shared_basic_filter = overrides.get("basic_filter")
         child_overrides: dict[str, dict] = {}
-        for cid in (pre_id, trig_id):
+        for cid in stages:
             child_override: dict = {}
             if self._override_loader is not None:
                 try:
@@ -1964,7 +1975,7 @@ class StrategyEngine:
 
         # 矩阵子策略的行情矩阵只需按完整历史窗口构建一次 (逐日复用, 避免重复加载)。
         child_markets: dict[str, Any] = {}
-        for cid in (pre_id, trig_id):
+        for cid in stages:
             child = self.get(cid)
             if child.execution_backend != "matrix_native":
                 continue
@@ -1982,9 +1993,8 @@ class StrategyEngine:
             expr = pl.col("__seq_day")
             return labeled.filter(expr <= day if upto else expr == day)
 
-        pre_hits: dict[str, set[str]] = {}
-        trig_hits: dict[str, set[str]] = {}
-        trig_results: dict[str, StrategyResult] = {}
+        hits_by_stage: list[dict[str, set[str]]] = [{} for _ in range(n_stages)]
+        stage_results: list[dict[str, StrategyResult]] = [{} for _ in range(n_stages)]
         for day in window:
             base_ctx = replace(
                 context,
@@ -1993,7 +2003,7 @@ class StrategyEngine:
                 history=_window_frame(day, upto=True),
                 market=None,
             )
-            for cid, sink in ((pre_id, pre_hits), (trig_id, trig_hits)):
+            for stage_index, cid in enumerate(stages):
                 child_ctx = replace(base_ctx, market=child_markets.get(cid))
                 result = self.run(
                     cid,
@@ -2002,13 +2012,12 @@ class StrategyEngine:
                     params=None,
                     overrides=child_overrides[cid],
                 )
-                sink[day] = seq_mod.result_symbols(result)
-                if cid == trig_id:
-                    trig_results[day] = result
+                hits_by_stage[stage_index][day] = seq_mod.result_symbols(result)
+                stage_results[stage_index][day] = result
 
-        events = seq_mod.match_events(window, pre_hits, trig_hits, max_gap)
+        events = seq_mod.match_events(window, hits_by_stage, min_gaps, max_gaps)
         matched = events.get(as_of_str) or {}
-        trigger_result = trig_results.get(as_of_str)
+        trigger_result = stage_results[-1].get(as_of_str)
 
         rows: list[dict] = []
         seen: set[str] = set()
@@ -2016,16 +2025,26 @@ class StrategyEngine:
             for row in trigger_result.rows:
                 symbol = str(row.get("symbol") or "")
                 if symbol in matched and symbol not in seen:
-                    rows.append({**row, "gap_days": matched[symbol]})
+                    gaps = matched[symbol]
+                    rows.append(
+                        {**row, "gap_days": sum(gaps), "gaps": list(gaps)}
+                    )
                     seen.add(symbol)
         # 无评分策略可能没有 rows, 用 symbol 兜底, 保证命中数不为 0。
-        for symbol, gap in matched.items():
+        for symbol, gaps in matched.items():
             if symbol in seen:
                 continue
             score = 0.0
             if trigger_result is not None:
                 score = float((trigger_result.scores or {}).get(symbol, 0.0))
-            rows.append({"symbol": symbol, "score": score, "gap_days": gap})
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "score": score,
+                    "gap_days": sum(gaps),
+                    "gaps": list(gaps),
+                }
+            )
             seen.add(symbol)
 
         order_desc = bool(strategy.meta.get("descending", True))
@@ -2039,23 +2058,35 @@ class StrategyEngine:
                 return []
             return [h for h in hits if str(h.get("symbol")) in matched]
 
-        pre_all = set().union(*pre_hits.values()) if pre_hits else set()
+        first_all = set().union(*hits_by_stage[0].values()) if hits_by_stage[0] else set()
+        stage_unique = [
+            len(set().union(*stage_hits.values())) if stage_hits else 0
+            for stage_hits in hits_by_stage
+        ]
+        last_hits_today = len(hits_by_stage[-1].get(as_of_str, ()))
         diagnostics = {
             "kind": "sequential",
-            "pre": pre_id,
-            "trigger": trig_id,
-            "max_gap_days": max_gap,
+            "stages": stages,
+            "min_gaps": min_gaps,
+            "max_gaps": max_gaps,
             "window": [window[0], window[-1]] if window else [],
-            # 前置在整个窗口内去重命中数; 触发只看当日 (入选日)
-            "pre_hits": len(pre_all),
-            "trigger_hits": len(trig_hits.get(as_of_str, ())),
+            # 兼容旧前端字段: 第一段窗口内去重命中 / 最后一段当日命中 / 最终交集
+            "pre": stages[0],
+            "trigger": stages[-1],
+            "max_gap_days": max_gaps[-1] if max_gaps else 0,
+            "pre_hits": len(first_all),
+            "trigger_hits": last_hits_today,
+            "stage_hits": stage_unique,
             "match": len(matched),
             "days": [
                 {
                     "date": day,
-                    "pre": len(pre_hits.get(day, ())),
-                    "trigger": len(trig_hits.get(day, ())),
+                    "pre": len(hits_by_stage[0].get(day, ())),
+                    "trigger": len(hits_by_stage[-1].get(day, ())),
                     "matched": len(events.get(day, {})),
+                    "stages": [
+                        len(stage_hits.get(day, ())) for stage_hits in hits_by_stage
+                    ],
                 }
                 for day in window
             ],
