@@ -29,6 +29,42 @@ import '@fontsource/jetbrains-mono/600.css'
 import '@fontsource/jetbrains-mono/700.css'
 import './index.css'
 
+// 重建/升级后, 已打开的页面仍持有旧哈希的懒加载分块, 动态 import 会 404
+// ("Failed to fetch dynamically imported module")。index.html 已是 no-store,
+// 但已加载的模块图不会自己更新 — 这里捕获分块加载失败并自动刷新一次。
+const _isChunkLoadError = (text: string) =>
+  /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module|dynamically imported module/i.test(
+    text,
+  )
+
+function _installChunkReloadGuard() {
+  const key = 'tickflow:chunk-reload-at'
+  const reloadOnce = () => {
+    try {
+      const last = Number(sessionStorage.getItem(key) || 0)
+      // 10 秒内只自动刷一次: 资源真的缺失时避免无限刷新
+      if (Date.now() - last < 10_000) return
+      sessionStorage.setItem(key, String(Date.now()))
+    } catch {
+      // sessionStorage 不可用 (隐私模式) 时直接刷新
+    }
+    window.location.reload()
+  }
+  window.addEventListener('unhandledrejection', event => {
+    const reason = event.reason
+    const text = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason ?? '')
+    if (!_isChunkLoadError(text)) return
+    event.preventDefault()
+    reloadOnce()
+  })
+  window.addEventListener('error', event => {
+    const text = String((event as ErrorEvent).message ?? '')
+    if (_isChunkLoadError(text)) reloadOnce()
+  })
+}
+
+_installChunkReloadGuard()
+
 // 全局认证拦截: 任何 query/mutation 收到 401 (未登录/会话过期) → 跳登录页。
 // api.ts 的 request() 已对 401 静默 (不弹 toast), 这里统一负责跳转。
 // 排除 /login 自身的请求, 避免登录页请求失败又跳登录形成死循环。
