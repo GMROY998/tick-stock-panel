@@ -31,6 +31,7 @@ from app.strategy.scoring import (
     scoring_value_expr,
     scoring_warmup_bars,
 )
+from app.strategy.sequential import SequentialSpec, parse_spec as parse_sequential_spec
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,7 @@ class StrategyDef:
     execution_backend: str = "polars_expr"
     matrix_strategy: Any | None = None
     composite: CompositeSpec | None = None  # 仅 backend=="composite" 时非空
+    sequential: SequentialSpec | None = None  # 仅 backend=="sequential" 时非空
     # 仅 backend=="minute_filter" 时非空: 输入为当日分钟K窗口, 输出为命中标的行
     filter_minute_history_fn: Callable[[pl.DataFrame, dict], pl.DataFrame] | None = None
     # 仅 minute_filter: META["daily_history_bars"] 声明需要的日线历史窗口 (0=不需要;
@@ -356,6 +358,20 @@ class StrategyEngine:
                 candidates.pop(sid, None)
                 candidate_paths.pop(sid, None)
 
+        # 第二阶段补充: 校验 sequential 引用的前置/触发策略。
+        for sid in list(candidates):
+            strategy = candidates[sid]
+            if strategy.execution_backend != "sequential" or strategy.sequential is None:
+                continue
+            error = self._validate_sequential_references(sid, strategy, candidates)
+            if error is not None:
+                errors.append({
+                    "file": str(strategy.file_path) if strategy.file_path else sid,
+                    "error": error,
+                })
+                candidates.pop(sid, None)
+                candidate_paths.pop(sid, None)
+
         self._load_errors = errors
         if errors and retain_previous_on_error:
             return False
@@ -413,6 +429,55 @@ class StrategyEngine:
                 return (
                     f"composite strategy {sid} 的 timeframes {parent_timeframes} "
                     f"未被子策略 {child.strategy_id!r} 完全支持(支持 {child_timeframes})"
+                )
+        return None
+
+    @staticmethod
+    def _validate_sequential_references(
+        sid: str,
+        strategy: StrategyDef,
+        candidates: Mapping[str, StrategyDef],
+    ) -> str | None:
+        """校验顺序策略的前置/触发引用 (两阶段第二阶段)。
+
+        规则:
+        - 两个子策略都必须已加载
+        - 禁止嵌套 composite/sequential
+        - 子策略必须是日线 (minute_filter 不支持)
+        - asset_types / timeframes 与父策略一致
+        """
+        assert strategy.sequential is not None
+        spec = strategy.sequential
+        parent_assets = list(strategy.meta.get("asset_types", ["stock"]))
+        parent_timeframes = list(strategy.meta.get("timeframes", ["1d"]))
+        for role, child_id in (
+            ("前置", spec.pre_strategy_id),
+            ("触发", spec.trigger_strategy_id),
+        ):
+            child_def = candidates.get(child_id)
+            if child_def is None:
+                return f"sequential strategy {sid} 引用的{role}策略 {child_id!r} 不存在"
+            if child_def.execution_backend in ("composite", "sequential"):
+                return (
+                    f"sequential strategy {sid} 引用的{role}策略 {child_id!r} "
+                    f"也是组合策略; 禁止嵌套"
+                )
+            if child_def.execution_backend == "minute_filter":
+                return (
+                    f"sequential strategy {sid} 的{role}策略 {child_id!r} 是分钟策略; "
+                    f"顺序策略首版仅支持日线"
+                )
+            child_assets = list(child_def.meta.get("asset_types", ["stock"]))
+            if not set(parent_assets).issubset(set(child_assets)):
+                return (
+                    f"sequential strategy {sid} 的 asset_types {parent_assets} "
+                    f"未被子策略 {child_id!r} 完全支持(支持 {child_assets})"
+                )
+            child_timeframes = list(child_def.meta.get("timeframes", ["1d"]))
+            if not set(parent_timeframes).issubset(set(child_timeframes)):
+                return (
+                    f"sequential strategy {sid} 的 timeframes {parent_timeframes} "
+                    f"未被子策略 {child_id!r} 完全支持(支持 {child_timeframes})"
                 )
         return None
 
@@ -537,7 +602,7 @@ class StrategyEngine:
                 ),
             )
         )
-        valid_backends = {"polars_expr", "matrix_native", "python_history_legacy", "composite", "minute_filter"}
+        valid_backends = {"polars_expr", "matrix_native", "python_history_legacy", "composite", "sequential", "minute_filter"}
         if execution_backend not in valid_backends:
             raise ValueError(
                 f"unsupported execution backend {execution_backend!r}; "
@@ -553,6 +618,7 @@ class StrategyEngine:
         if isinstance(module_scoring, dict) and module_scoring:
             scoring_columns = tuple(str(k) for k in module_scoring)
         composite_spec: CompositeSpec | None = None
+        sequential_spec: SequentialSpec | None = None
         minute_daily_bars = 0
         if execution_backend == "matrix_native":
             from app.backtest.matrix import MatrixStrategy
@@ -579,6 +645,22 @@ class StrategyEngine:
                     "composite strategy must not declare filter, filter_history or MATRIX_STRATEGY"
                 )
             composite_spec = _parse_composite_children(meta.get("children"))
+        elif execution_backend == "sequential":
+            # 顺序策略同样是声明式的: META["sequential"] 指定 前置A → 触发B 与最大间隔。
+            # 子策略存在性/非嵌套/asset_types 一致性延后到 _load_all 两阶段校验。
+            if (
+                filter_fn is not None
+                or filter_history_fn is not None
+                or filter_minute_history_fn is not None
+                or matrix_strategy is not None
+            ):
+                raise ValueError(
+                    "sequential strategy must not declare filter, filter_history, "
+                    "filter_minute_history or MATRIX_STRATEGY"
+                )
+            if meta.get("timeframes") not in (None, ["1d"]):
+                raise ValueError("sequential strategy must declare timeframes == ['1d']")
+            sequential_spec = parse_sequential_spec(meta.get("sequential"))
         elif execution_backend == "minute_filter":
             # 分钟形态策略: 只声明 filter_minute_history; 数据源是本地当日分钟K分区
             # (由 ScreenerService.build_strategy_context 的 1m 分支注入), 因此 timeframes
@@ -635,6 +717,7 @@ class StrategyEngine:
             execution_backend=execution_backend,
             matrix_strategy=matrix_strategy,
             composite=composite_spec,
+            sequential=sequential_spec,
             filter_minute_history_fn=filter_minute_history_fn,
             minute_daily_bars=minute_daily_bars,
             scoring_columns=scoring_columns,
@@ -808,6 +891,23 @@ class StrategyEngine:
                     required,
                     self.required_history_bars(child_ids, params_map=params_map),
                 )
+            elif strategy.execution_backend == "sequential":
+                # 顺序策略 = 子策略预热 + 最大等待窗口 (A 可能命中在 N 个交易日之前)。
+                if strategy.sequential is None:
+                    continue
+                spec = strategy.sequential
+                gap = spec.max_gap_days
+                override_params = (overrides_map.get(strategy_id) or {}).get("params") or {}
+                try:
+                    gap = int(override_params.get("max_gap_days", gap))
+                except (TypeError, ValueError):
+                    gap = spec.max_gap_days
+                child_required = self.required_history_bars(
+                    [spec.pre_strategy_id, spec.trigger_strategy_id],
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                )
+                required = max(required, child_required + max(0, gap))
             elif strategy.filter_history_fn:
                 # lookback_days 优先取自解析后的参数(默认值/保存覆盖/本次调用),
                 # 静态 LOOKBACK_DAYS 兜底。策略可能只把窗口声明为参数
@@ -988,6 +1088,17 @@ class StrategyEngine:
 
         if s.execution_backend == "composite":
             return self._run_composite_strategy(
+                strategy_id,
+                s,
+                context,
+                pool=pool,
+                params=params,
+                overrides=overrides,
+                started_at=t0,
+            )
+
+        if s.execution_backend == "sequential":
+            return self._run_sequential_strategy(
                 strategy_id,
                 s,
                 context,
@@ -1291,7 +1402,7 @@ class StrategyEngine:
             (sid, strategy)
             for sid, strategy in selected
             if strategy.filter_history_fn
-            or strategy.execution_backend in ("matrix_native", "minute_filter")
+            or strategy.execution_backend in ("matrix_native", "minute_filter", "sequential")
         ]
         shared_history = context.history
         if history_strats and shared_history is None:
@@ -1765,6 +1876,179 @@ class StrategyEngine:
             total=len(rows),
             elapsed_ms=(time.perf_counter() - started_at) * 1000,
             scores=scores,
+        )
+
+    def _run_sequential_strategy(
+        self,
+        strategy_id: str,
+        strategy: StrategyDef,
+        context: StrategyDataContext,
+        *,
+        pool: list[str] | None = None,
+        params: dict | None = None,
+        overrides: dict | None = None,
+        started_at: float,
+    ) -> StrategyResult:
+        """顺序策略: 前置 A 命中后 N 个交易日内触发 B 命中才入选。
+
+        做法: 在历史窗口内逐交易日重放 A/B 的命中集合, 再用状态机判定触发日。
+        - 只使用 as_of 及之前的数据, 无未来函数;
+        - A/B 之间出现卖点不作废 (按产品约定);
+        - 输出日 = 触发日 (B 命中日), 评分取 B 当日评分, 附带 gap_days。
+        """
+        from app.strategy import sequential as seq_mod
+
+        assert strategy.sequential is not None
+        params = params or {}
+        overrides = overrides or {}
+        spec = strategy.sequential
+        max_gap = int(params.get("max_gap_days", spec.max_gap_days))
+        max_gap = max(0, min(max_gap, seq_mod.MAX_GAP_DAYS))
+        pre_id = spec.pre_strategy_id
+        trig_id = spec.trigger_strategy_id
+
+        history = context.history
+        if history is None or history.is_empty():
+            raise ValueError(
+                f"sequential strategy {strategy_id} requires history data"
+            )
+        if "date" not in history.columns:
+            raise ValueError(
+                f"sequential strategy {strategy_id} history 缺少 date 列"
+            )
+
+        # 历史帧的 date 可能是 Date / Datetime / int(YYYYMMDD), 统一归一成
+        # YYYY-MM-DD 再比较, 避免因 cast(Utf8) 结果带时分秒导致 as_of 匹配不上。
+        date_dtype = history.schema.get("date")
+        if date_dtype in (pl.Date, pl.Datetime) or isinstance(date_dtype, pl.Datetime):
+            day_expr = pl.col("date").dt.strftime("%Y-%m-%d")
+        elif date_dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+            _raw = pl.col("date").cast(pl.Utf8)
+            day_expr = (
+                _raw.str.slice(0, 4) + "-" + _raw.str.slice(4, 2) + "-" + _raw.str.slice(6, 2)
+            )
+        else:
+            day_expr = pl.col("date").cast(pl.Utf8).str.slice(0, 10)
+        labeled = history.with_columns(day_expr.alias("__seq_day"))
+        all_dates = sorted(
+            str(item) for item in labeled.get_column("__seq_day").unique().to_list() if item
+        )
+        as_of_str = str(context.as_of)
+        if as_of_str not in all_dates:
+            return StrategyResult(
+                as_of=context.as_of,
+                strategy_id=strategy_id,
+                elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            )
+        end_idx = all_dates.index(as_of_str)
+        window = all_dates[max(0, end_idx - max_gap): end_idx + 1]
+
+        # 子策略覆盖: 与 composite 同口径, 加载各自保存配置 + 统一 basic_filter。
+        shared_basic_filter = overrides.get("basic_filter")
+        child_overrides: dict[str, dict] = {}
+        for cid in (pre_id, trig_id):
+            child_override: dict = {}
+            if self._override_loader is not None:
+                try:
+                    loaded = self._override_loader(cid)
+                    if isinstance(loaded, dict):
+                        child_override = dict(loaded)
+                except Exception:  # noqa: BLE001
+                    pass
+            if shared_basic_filter:
+                child_override["basic_filter"] = shared_basic_filter
+            child_overrides[cid] = child_override
+
+        # 矩阵子策略的行情矩阵只需按完整历史窗口构建一次 (逐日复用, 避免重复加载)。
+        child_markets: dict[str, Any] = {}
+        for cid in (pre_id, trig_id):
+            child = self.get(cid)
+            if child.execution_backend != "matrix_native":
+                continue
+            from app.backtest.matrix import build_market_data_matrix
+
+            child_params = self.resolve_params(child, None, child_overrides[cid])
+            child_markets[cid] = build_market_data_matrix(
+                history,
+                field_columns=self._matrix_field_columns(
+                    child, child_overrides[cid], child_params
+                ),
+            )
+
+        def _window_frame(day: str, *, upto: bool):
+            expr = pl.col("__seq_day")
+            return labeled.filter(expr <= day if upto else expr == day)
+
+        pre_hits: dict[str, set[str]] = {}
+        trig_hits: dict[str, set[str]] = {}
+        trig_results: dict[str, StrategyResult] = {}
+        for day in window:
+            base_ctx = replace(
+                context,
+                as_of=date.fromisoformat(day),
+                current=_window_frame(day, upto=False),
+                history=_window_frame(day, upto=True),
+                market=None,
+            )
+            for cid, sink in ((pre_id, pre_hits), (trig_id, trig_hits)):
+                child_ctx = replace(base_ctx, market=child_markets.get(cid))
+                result = self.run(
+                    cid,
+                    child_ctx,
+                    pool=pool,
+                    params=None,
+                    overrides=child_overrides[cid],
+                )
+                sink[day] = seq_mod.result_symbols(result)
+                if cid == trig_id:
+                    trig_results[day] = result
+
+        events = seq_mod.match_events(window, pre_hits, trig_hits, max_gap)
+        matched = events.get(as_of_str) or {}
+        trigger_result = trig_results.get(as_of_str)
+
+        rows: list[dict] = []
+        seen: set[str] = set()
+        if trigger_result is not None:
+            for row in trigger_result.rows:
+                symbol = str(row.get("symbol") or "")
+                if symbol in matched and symbol not in seen:
+                    rows.append({**row, "gap_days": matched[symbol]})
+                    seen.add(symbol)
+        # 无评分策略可能没有 rows, 用 symbol 兜底, 保证命中数不为 0。
+        for symbol, gap in matched.items():
+            if symbol in seen:
+                continue
+            score = 0.0
+            if trigger_result is not None:
+                score = float((trigger_result.scores or {}).get(symbol, 0.0))
+            rows.append({"symbol": symbol, "score": score, "gap_days": gap})
+            seen.add(symbol)
+
+        order_desc = bool(strategy.meta.get("descending", True))
+        rows.sort(key=lambda item: float(item.get("score") or 0.0), reverse=order_desc)
+        limit = self._result_limit(strategy, overrides)
+        if limit is not None:
+            rows = rows[:limit]
+
+        def _pick_hits(hits: list[dict] | None) -> list[dict]:
+            if not hits:
+                return []
+            return [h for h in hits if str(h.get("symbol")) in matched]
+
+        return StrategyResult(
+            as_of=context.as_of,
+            strategy_id=strategy_id,
+            rows=rows,
+            total=len(rows),
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            scores={str(row.get("symbol")): float(row.get("score") or 0.0) for row in rows},
+            entry_signal_hits=_pick_hits(
+                getattr(trigger_result, "entry_signal_hits", None)
+            ),
+            exit_signal_hits=_pick_hits(
+                getattr(trigger_result, "exit_signal_hits", None)
+            ),
         )
 
     @staticmethod

@@ -940,6 +940,14 @@ export interface StrategyDetail {
   limit: number
   // 叠加策略(composite)专属: 子策略列表与合并模式。非 composite 时为 null。
   composite_children?: CompositeChildInfo[] | null
+  /** 顺序策略: 前置/触发子策略与最大间隔 */
+  sequential?: {
+    pre: string
+    trigger: string
+    max_gap_days: number
+    pre_meta?: { id: string; name: string } | null
+    trigger_meta?: { id: string; name: string } | null
+  } | null
 }
 
 export type ScoringDirection = 'high' | 'low'
@@ -5222,6 +5230,21 @@ export const api = {
     mode: 'create' | 'update'
   }) =>
     request<StrategyCodeSaveResult>('/api/strategies/composite/save', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** 保存顺序策略 (前置 A → 触发 B, 最大间隔 N 个交易日) */
+  strategySaveSequential: (payload: {
+    strategy_id: string
+    name: string
+    description?: string
+    pre_strategy_id: string
+    trigger_strategy_id: string
+    max_gap_days: number
+    mode?: 'create' | 'update'
+  }) =>
+    request<StrategyCodeSaveResult>('/api/strategies/sequential/save', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal } from 'lucide-react'
+import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal, ArrowRight } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { useMinuteBatchQuery } from '@/lib/useMinuteBatchQuery'
 import { fetchDailyBatchChunked } from '@/lib/klineBatchChunked'
@@ -31,6 +31,7 @@ import { cn } from '@/lib/cn'
 import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDialog'
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
 import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategyDialog'
+import { SequentialStrategyDialog } from '@/components/screener/SequentialStrategyDialog'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
@@ -77,6 +78,7 @@ export function Screener() {
   const [showStore, setShowStore] = useState(false)
   const [showDefaultParams, setShowDefaultParams] = useState(false)
   const [showComposite, setShowComposite] = useState(false)
+  const [showSequential, setShowSequential] = useState(false)
   const strategyPool = useStrategyPool()
   const { pool, addToPool, removeFromPool, prune, metaMap, groups, handleStrategyDeleted } = strategyPool
   const [cardSize, setCardSize] = useState<CardSize>(loadCardSize)
@@ -1167,6 +1169,16 @@ export function Screener() {
               <Layers className="h-3.5 w-3.5" />
               叠加策略
             </button>
+            {/* 创建顺序策略 */}
+            <button
+              onClick={() => setShowSequential(true)}
+              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
+                text-xs font-medium text-cyan-400 border border-cyan-500/20 bg-cyan-500/5
+                hover:bg-cyan-500/15 transition-colors cursor-pointer"
+            >
+              <ArrowRight className="h-3.5 w-3.5" />
+              顺序策略
+            </button>
             {/* 创建策略 */}
             <button
               onClick={() => { setBuilderMode('create'); setShowBuilder(true) }}
@@ -1589,6 +1601,19 @@ export function Screener() {
           const data = await qc.fetchQuery({ queryKey: [...QK.screenerStrategies('all'), 'all'], queryFn: () => api.screenerStrategies(undefined, 'all'), staleTime: 0 })
           addToPool(id)
           // 新建叠加策略为日线时立即扫描, 免去手动点刷新 (分钟策略仍手动单跑)
+          const preset = data.presets.find(s => s.id === id)
+          if (assetType === 'stock' && preset && !preset.timeframes?.includes('1m')) {
+            requestRunAll({ date: asOf || undefined, strategyIds: [id] })
+          }
+        }}
+      />
+
+      <SequentialStrategyDialog
+        open={showSequential}
+        onClose={() => setShowSequential(false)}
+        onSavedId={async id => {
+          const data = await qc.fetchQuery({ queryKey: [...QK.screenerStrategies('all'), 'all'], queryFn: () => api.screenerStrategies(undefined, 'all'), staleTime: 0 })
+          addToPool(id)
           const preset = data.presets.find(s => s.id === id)
           if (assetType === 'stock' && preset && !preset.timeframes?.includes('1m')) {
             requestRunAll({ date: asOf || undefined, strategyIds: [id] })

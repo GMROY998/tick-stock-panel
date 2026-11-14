@@ -244,6 +244,18 @@ def _strategy_detail(
             if s.execution_backend == "composite"
             else None
         ),
+        # 顺序策略: 前置/触发子策略与最大间隔(供前端展示与回填)。
+        "sequential": (
+            {
+                "pre": s.sequential.pre_strategy_id,
+                "trigger": s.sequential.trigger_strategy_id,
+                "max_gap_days": s.sequential.max_gap_days,
+                "pre_meta": _child_meta(engine, s.sequential.pre_strategy_id),
+                "trigger_meta": _child_meta(engine, s.sequential.trigger_strategy_id),
+            }
+            if s.execution_backend == "sequential" and s.sequential is not None
+            else None
+        ),
     }
 
 
@@ -319,6 +331,16 @@ class StrategyCompositeSaveRequest(BaseModel):
     children: list[CompositeChildItem]
     merge_mode: Literal["union", "intersect"] = "union"
     min_confirm: int = 0
+    mode: Literal["create", "update"] = "create"
+
+
+class StrategySequentialSaveRequest(BaseModel):
+    strategy_id: str
+    name: str = ""
+    description: str = ""
+    pre_strategy_id: str
+    trigger_strategy_id: str
+    max_gap_days: int = 3
     mode: Literal["create", "update"] = "create"
 
 
@@ -523,7 +545,7 @@ def _overlay_changed(old, new) -> bool:
 
 # 叠加条件第一版只支持日线 polars_expr / matrix_native; composite 已有自身
 # 的叠加合并语义, minute 帧不带 enriched 列 (ext_*/因子列不可见)。
-_OVERLAY_UNSUPPORTED_BACKENDS = frozenset({"composite", "minute_filter"})
+_OVERLAY_UNSUPPORTED_BACKENDS = frozenset({"composite", "sequential", "minute_filter"})
 
 
 def _validate_overlay_filter(strategy, overrides: dict) -> None:
@@ -1338,6 +1360,134 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
 def save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request):
     try:
         return _save_composite_strategy(req, request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _render_sequential_code(
+    sid: str,
+    name: str,
+    description: str,
+    pre_strategy_id: str,
+    trigger_strategy_id: str,
+    max_gap_days: int,
+) -> str:
+    """渲染声明式 sequential 策略 .py 文件内容 (无业务代码)。"""
+    safe_name = name or sid
+    return f'''"""顺序策略 {sid}（自动生成, 请勿手改业务逻辑）。"""
+META = {{
+    "id": {sid!r},
+    "name": {safe_name!r},
+    "description": {description!r},
+    "asset_types": ["stock"],
+    "timeframes": ["1d"],
+    "params": [
+        {{"id": "max_gap_days", "label": "最大间隔(交易日)", "type": "int",
+          "default": {int(max_gap_days)!r}, "min": 0, "max": 60}},
+    ],
+    "scoring": {{}},
+    "order_by": "score",
+    "descending": True,
+    "limit": 100,
+    "sequential": {{
+        "pre": {pre_strategy_id!r},
+        "trigger": {trigger_strategy_id!r},
+        "max_gap_days": {int(max_gap_days)!r},
+    }},
+}}
+EXECUTION_BACKEND = "sequential"
+'''
+
+
+def _save_sequential_strategy(req: StrategySequentialSaveRequest, request: Request) -> dict:
+    """保存顺序策略: 渲染声明式 .py → 写盘 → reload → 校验。"""
+    sid = _validate_strategy_id(req.strategy_id)
+    if not sid.startswith("sequential_"):
+        raise ValueError("顺序策略 ID 必须以 sequential_ 开头")
+    if req.pre_strategy_id == req.trigger_strategy_id:
+        raise ValueError("前置策略与触发策略不能相同")
+    if req.max_gap_days < 0 or req.max_gap_days > 60:
+        raise ValueError("max_gap_days 必须在 [0, 60] 之间")
+
+    engine = _get_engine(request)
+    data_dir = _data_dir(request)
+
+    existing: StrategyDef | None = None
+    try:
+        existing = engine.get(sid)
+    except ValueError:
+        existing = None
+
+    if req.mode == "create":
+        if existing is not None:
+            raise ValueError(f"策略 {sid} 已存在，请改用修改模式或换一个策略 ID")
+    else:
+        if existing is None:
+            raise ValueError(f"策略 {sid} 不存在")
+        if existing.execution_backend != "sequential":
+            raise ValueError("目标策略不是顺序策略，无法以顺序模式覆盖")
+
+    for cid, role in (
+        (req.pre_strategy_id, "前置"),
+        (req.trigger_strategy_id, "触发"),
+    ):
+        try:
+            child_def = _get_public_strategy(engine, cid)
+        except HTTPException as exc:
+            raise ValueError(f"{role}策略 {cid!r} 不存在") from exc
+        if child_def.execution_backend in ("composite", "sequential"):
+            raise ValueError(f"{role}策略 {cid!r} 也是组合策略; 禁止嵌套")
+        if child_def.execution_backend == "minute_filter":
+            raise ValueError(f"{role}策略 {cid!r} 是分钟策略; 顺序策略仅支持日线")
+
+    code = _render_sequential_code(
+        sid,
+        req.name,
+        req.description,
+        req.pre_strategy_id,
+        req.trigger_strategy_id,
+        req.max_gap_days,
+    )
+
+    # 与叠加策略共用 composite 目录 (两者都是声明式包装策略)
+    out_dir = _target_dir(data_dir, "composite")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{sid}.py"
+    previous_code = path.read_text(encoding="utf-8") if path.exists() else None
+    path.write_text(code, encoding="utf-8")
+
+    try:
+        engine.reload()
+        loaded = engine.get(sid)
+        if loaded.file_path is None or loaded.file_path.resolve() != path.resolve():
+            raise ValueError("策略加载到了非预期文件，请检查是否存在重复 strategy_id")
+        if loaded.execution_backend != "sequential":
+            raise ValueError(f"策略后端异常: 期望 sequential, 实际 {loaded.execution_backend}")
+        if loaded.sequential is None:
+            raise ValueError("策略缺少 sequential 声明")
+    except Exception as e:
+        _restore_strategy_file(path, previous_code)
+        engine.reload()
+        raise ValueError(f"顺序策略保存失败: {e}") from e
+
+    _invalidate_strategy_runtime(request)
+
+    with contextlib.suppress(Exception):
+        strategy_pool.register(sid)
+
+    return {
+        "ok": True,
+        "strategy_id": sid,
+        "source": "composite",
+        "backend": "sequential",
+        "path": str(path),
+    }
+
+
+@router.post("/sequential/save")
+def save_sequential_strategy(req: StrategySequentialSaveRequest, request: Request):
+    try:
+        return _save_sequential_strategy(req, request)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 

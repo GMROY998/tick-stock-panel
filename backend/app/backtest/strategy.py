@@ -968,6 +968,80 @@ class StrategyBacktestService:
         _ = composite_mod  # 确保模块可导入(回测时由调用方使用)
         return merged_plan, resolved_children
 
+    def _resolve_sequential_feature_plan(
+        self,
+        strategy: StrategyDef,
+        *,
+        params: dict,
+        basic_filter: dict,
+        overrides: dict,
+        asset_type: str = "stock",
+    ) -> tuple[ResolvedFeaturePlan, list[tuple[StrategyDef, dict, dict]]]:
+        """解析 sequential 回测的特征计划: 前置 + 触发两个子策略计划的并集。
+
+        与 composite 回测一致, 子策略必须全为 matrix_native (首版硬约束),
+        保证顺序状态机在策略选股与回测两处口径完全一致。
+        """
+        assert strategy.sequential is not None
+        spec = strategy.sequential
+        child_ids = [spec.pre_strategy_id, spec.trigger_strategy_id]
+
+        resolver = StrategyDependencyResolver()
+        plans: list[ResolvedFeaturePlan] = []
+        resolved_children: list[tuple[StrategyDef, dict, dict]] = []
+        for cid in child_ids:
+            child_def = self.strategy_engine.get(cid)
+            if child_def.execution_backend != "matrix_native":
+                raise ValueError(
+                    f"顺序回测暂仅支持矩阵子策略; {cid!r} "
+                    f"是 {child_def.execution_backend}"
+                )
+            if child_def.matrix_strategy is None:
+                raise ValueError(f"子策略 {cid!r} 未注册矩阵策略")
+            child_override: dict = {}
+            loader = getattr(self.strategy_engine, "_override_loader", None)
+            if loader is not None:
+                try:
+                    loaded = loader(cid)
+                    if isinstance(loaded, dict):
+                        child_override = dict(loaded)
+                except Exception:  # noqa: BLE001
+                    pass
+            child_params = self.strategy_engine.resolve_params(
+                child_def, overrides=child_override
+            )
+            plans.append(
+                resolver.resolve(
+                    child_def,
+                    params=child_params,
+                    basic_filter=basic_filter,
+                    entry_signals=[],
+                    exit_signals=[],
+                    overrides=child_override,
+                    asset_type=asset_type,
+                )
+            )
+            child_scoring = effective_scoring(
+                child_def.meta.get("scoring"), child_override
+            )
+            resolved_children.append(
+                (
+                    child_def,
+                    child_params,
+                    MatrixPipelineConfig(
+                        basic_filter=basic_filter,
+                        scoring=child_scoring,
+                        scoring_directions=effective_scoring_directions(child_override),
+                        order_by=child_def.meta.get("order_by"),
+                        descending=bool(child_def.meta.get("descending", True)),
+                        protect_strategy_cache=False,
+                    ),
+                )
+            )
+
+        self._sequential_child_order = list(child_ids)
+        return _merge_resolved_feature_plans(plans), resolved_children
+
     def _generate_composite_signal_matrix(
         self,
         resolved_children: list[tuple[StrategyDef, dict, dict]],
@@ -1010,6 +1084,44 @@ class StrategyBacktestService:
             children_weights,
             merge_mode,
             min_confirm,
+            max_hold,
+        )
+
+    def _generate_sequential_signal_matrix(
+        self,
+        resolved_children: list[tuple[StrategyDef, dict, dict]],
+        market_data: MarketDataMatrix,
+        max_gap_days: int,
+        max_hold: int,
+        timing_ms: dict[str, float],
+    ):
+        """顺序回测信号: 逐子策略算 SignalMatrix, 再用状态机合并。
+
+        合并语义见 app.strategy.sequential.merge_signal_matrices:
+        entry = trigger & (pre 在最近 N 个交易日内命中过), exit 来源投影到 trigger。
+        """
+        from app.strategy import sequential as sequential_mod
+
+        t_signals = time.perf_counter()
+        sigs = []
+        for child_def, child_params, child_pipeline_cfg in resolved_children:
+            try:
+                child_sig = MatrixStrategyPipeline().run(
+                    child_def.matrix_strategy,
+                    market_data,
+                    child_params,
+                    child_pipeline_cfg,
+                )
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"子策略 {child_def.meta.get('id')} 信号计算失败: {e}"
+                ) from e
+            sigs.append(child_sig)
+        timing_ms["strategy_signals"] = round((time.perf_counter() - t_signals) * 1000, 1)
+        return sequential_mod.merge_signal_matrices(
+            market_data.shape,
+            sigs,
+            max_gap_days,
             max_hold,
         )
 
@@ -1447,6 +1559,15 @@ class StrategyBacktestService:
                     overrides=overrides,
                     asset_type=config.asset_type,
                 )
+            elif s.execution_backend == "sequential":
+                # sequential 回测: 前置 + 触发两个矩阵子策略, 计划取并集。
+                feature_plan, composite_children_resolved = self._resolve_sequential_feature_plan(
+                    s,
+                    params=params,
+                    basic_filter=basic_filter,
+                    overrides=overrides,
+                    asset_type=config.asset_type,
+                )
             else:
                 composite_children_resolved = None
                 feature_plan = StrategyDependencyResolver().resolve(
@@ -1636,8 +1757,8 @@ class StrategyBacktestService:
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
 
-        if s.execution_backend == "composite":
-            # composite 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
+        if s.execution_backend in ("composite", "sequential"):
+            # composite / sequential 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
             # 退出采用来源投影(composite.merge_signal_matrices), 不串平其他子策略仓位。
             if composite_children_resolved is None:
                 return _err("叠加策略子策略解析失败")
@@ -1684,30 +1805,54 @@ class StrategyBacktestService:
                 else None
             )
 
+            # max_hold 用于退出投影窗口封顶; 无值时给一个足够大的兜底(仅靠信号退出)。
+            strategy_max_hold = max(int(max_hold_days or 0), 1) if max_hold_days else 250
             merge_mode = str(params.get("merge_mode") or "union")
             min_confirm = int(params.get("min_confirm") or 0)
-            # max_hold 用于退出投影窗口封顶; 无值时给一个足够大的兜底(仅靠信号退出)。
-            composite_max_hold = max(int(max_hold_days or 0), 1) if max_hold_days else 250
-            try:
-                signal_matrix = self._generate_composite_signal_matrix(
-                    composite_children_resolved,
-                    market_data,
-                    merge_mode,
-                    min_confirm,
-                    composite_max_hold,
-                    timing_ms,
+            seq_max_gap = 0
+            if s.execution_backend == "sequential":
+                seq_spec = s.sequential
+                seq_max_gap = int(
+                    params.get("max_gap_days", seq_spec.max_gap_days if seq_spec else 3)
                 )
+            try:
+                if s.execution_backend == "sequential":
+                    signal_matrix = self._generate_sequential_signal_matrix(
+                        composite_children_resolved,
+                        market_data,
+                        seq_max_gap,
+                        strategy_max_hold,
+                        timing_ms,
+                    )
+                else:
+                    signal_matrix = self._generate_composite_signal_matrix(
+                        composite_children_resolved,
+                        market_data,
+                        merge_mode,
+                        min_confirm,
+                        strategy_max_hold,
+                        timing_ms,
+                    )
             except ValueError as e:
                 return _err(str(e))
 
             if evidence is not None:
-                evidence.check_matrix(
-                    market_data, signal_matrix,
-                    lambda data: self._generate_composite_signal_matrix(
-                        composite_children_resolved, data, merge_mode, min_confirm,
-                        composite_max_hold, {},
-                    ),
-                )
+                if s.execution_backend == "sequential":
+                    evidence.check_matrix(
+                        market_data, signal_matrix,
+                        lambda data: self._generate_sequential_signal_matrix(
+                            composite_children_resolved, data, seq_max_gap,
+                            strategy_max_hold, {},
+                        ),
+                    )
+                else:
+                    evidence.check_matrix(
+                        market_data, signal_matrix,
+                        lambda data: self._generate_composite_signal_matrix(
+                            composite_children_resolved, data, merge_mode, min_confirm,
+                            strategy_max_hold, {},
+                        ),
+                    )
 
             sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
             sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
@@ -2088,6 +2233,16 @@ class StrategyBacktestService:
                     ]
                 }
                 if s.execution_backend == "composite"
+                else {
+                    "sequential": {
+                        "pre": s.sequential.pre_strategy_id,
+                        "trigger": s.sequential.trigger_strategy_id,
+                        "max_gap_days": int(
+                            params.get("max_gap_days", s.sequential.max_gap_days)
+                        ),
+                    }
+                }
+                if s.execution_backend == "sequential" and s.sequential is not None
                 else {}
             ),
         } if result_policy.include_strategy_info else {}
