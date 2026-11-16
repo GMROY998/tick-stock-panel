@@ -8,6 +8,7 @@ Starter+ 盘后可用 quotes.get(universes) 顺便补充 name。
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import polars as pl
@@ -86,13 +87,19 @@ def sync_instruments(data_dir: Path) -> int:
         current_limits = tf_client.current_mode() == "api_key"
         all_rows = []
         for ex in _EXCHANGES:
-            try:
-                items = tf.exchanges.get_instruments(ex, instrument_type="stock")
-                if items:
-                    all_rows.extend(_flatten_instruments(items, current_limits=current_limits))
-                    logger.info("instruments %s: %d stocks", ex, len(items))
-            except Exception as e:
-                logger.warning("get_instruments(%s) failed: %s", ex, e)
+            # 单个交易所瞬时失败不应静默丢整个市场: 重试一次再放弃。
+            for attempt in range(2):
+                try:
+                    items = tf.exchanges.get_instruments(ex, instrument_type="stock")
+                    if items:
+                        all_rows.extend(_flatten_instruments(items, current_limits=current_limits))
+                        logger.info("instruments %s: %d stocks", ex, len(items))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 1:
+                        logger.warning("get_instruments(%s) failed: %s", ex, e)
+                    else:
+                        time.sleep(1.0)
 
     if not all_rows:
         return 0
@@ -102,6 +109,22 @@ def sync_instruments(data_dir: Path) -> int:
     df = df.with_columns(pl.lit(cn_today()).alias("as_of"))
 
     out = data_dir / "instruments" / "instruments.parquet"
+    # 防"部分成功"覆盖全量: 某一交易所拉取失败时行数会骤降, 直接覆盖会让
+    # 该市场的标的彻底消失 (名称/股本/板块缺失 → 策略筛不出、自选不显示名称)。
+    if out.exists():
+        try:
+            existing_rows = pl.read_parquet(out, columns=["symbol"]).height
+        except Exception:  # noqa: BLE001
+            existing_rows = 0
+        # 仅对真实市场规模 (>500 行) 生效; 测试/小样本维表不触发。
+        if existing_rows >= 500 and df.height < existing_rows * 0.9:
+            logger.error(
+                "instruments 同步结果异常偏少 (%d 行 < 原有 %d 行的 90%%), "
+                "拒绝覆盖以保住市场覆盖",
+                df.height,
+                existing_rows,
+            )
+            return 0
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
 
