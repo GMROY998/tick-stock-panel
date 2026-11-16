@@ -31,7 +31,12 @@ from app.strategy.scoring import (
     scoring_value_expr,
     scoring_warmup_bars,
 )
+from app.strategy import polars_compat as _polars_compat
 from app.strategy.sequential import SequentialSpec, parse_spec as parse_sequential_spec
+
+# polars 1.4x 移除了模块级 arctan/arcsin/arccos, 历史生成策略仍在用
+# pl.arctan(...) — 启动时补回别名, 避免策略运行 500。
+_polars_compat.install()
 
 logger = logging.getLogger(__name__)
 
