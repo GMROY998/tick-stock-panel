@@ -1139,6 +1139,24 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
 
   const backtestTask = useBacktestTask()
   const isPending = backtestTask?.isPending ?? false
+
+  // 进入页面先刷新策略列表: 删除/重建策略后, 缓存里的旧列表会让"已删除"的
+  // 策略看起来仍然可选, 进而跑到后端报 unknown strategy。
+  useEffect(() => {
+    queryClient.invalidateQueries({ queryKey: QK.screenerStrategies(assetType, 'all') })
+  }, [assetType, queryClient])
+
+  // 后端返回 "unknown strategy" 说明选中的策略已不存在: 清空选择并强制刷新
+  // 列表, 避免同一个错误反复出现 (列表缓存未及时失效时尤其明显)。
+  useEffect(() => {
+    const message = String(backtestTask?.error ?? '')
+    if (!/unknown strategy/i.test(message)) return
+    setSelectedStrategy(null)
+    setStrategyParams({})
+    setOverrides({})
+    setResult(null)
+    queryClient.invalidateQueries({ queryKey: QK.screenerStrategies(assetType, 'all') })
+  }, [backtestTask?.error, assetType, queryClient])
   const saveCandidate = useMutation({
     mutationFn: () => {
       if (!result) throw new Error('暂无策略结果')
